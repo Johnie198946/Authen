@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:14-alpine
+    container_name: auth_postgres
+    environment:
+      POSTGRES_DB: auth
+      POSTGRES_USER: authuser
+      POSTGRES_PASSWORD: authpass123
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - auth_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authuser -d auth"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    container_name: auth_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - auth_network
+
+  # RabbitMQ消息队列
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: auth_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: authuser
+      RABBITMQ_DEFAULT_PASS: authpass123
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - auth_network
+
+  # API网关服务
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    container_name: auth_gateway
+    ports:
+      - "8008:8008"
+    environment:
+      DATABASE_URL: postgresql://authuser:authpass123@postgres:5432/auth
+      REDIS_URL: redis://redis:6379/0
+      AUTH_SERVICE_URL: http://auth:8001
+      SSO_SERVICE_URL: http://sso:8002
+      USER_SERVICE_URL: http://user:8003
+      PERMISSION_SERVICE_URL: http://permission:8004
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - auth_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  auth_network:
+    driver: bridge
