@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Descriptions, Tag, Typography } from 'antd';
 import type { WizardData } from './types';
 import { METHOD_LABELS, OAUTH_METHODS } from './types';
-import { orgApi, subApi } from '../../../api/services';
+import { orgApi, subApi, roleApi, permissionApi } from '../../../api/services';
 
 const { Text } = Typography;
 
@@ -29,28 +29,50 @@ function flattenOrgs(nodes: OrgNode[]): Map<string, string> {
 }
 
 const ReviewStep: React.FC<ReviewStepProps> = ({ wizardData }) => {
-  const { basicInfo, loginMethods, scopes, rateLimit, organizations, subscriptionPlanId } = wizardData;
+  const { basicInfo, loginMethods, scopes, rateLimit, organizations, subscriptionPlanId, autoProvision } = wizardData;
   const enabledMethods = loginMethods.filter((m) => m.is_enabled);
   const hasEnabledMethods = enabledMethods.length > 0;
   const hasScopes = scopes.length > 0;
 
   const [orgNames, setOrgNames] = useState<Map<string, string>>(new Map());
   const [planName, setPlanName] = useState<string>('');
+  const [roleNames, setRoleNames] = useState<Map<string, string>>(new Map());
+  const [permissionNames, setPermissionNames] = useState<Map<string, string>>(new Map());
 
   useEffect(() => {
-    if (organizations.length > 0) {
+    if (organizations.length > 0 || autoProvision.organizationId) {
       orgApi.tree().then((res) => setOrgNames(flattenOrgs(res.data))).catch(() => {});
     }
-  }, [organizations]);
+  }, [organizations, autoProvision.organizationId]);
 
   useEffect(() => {
-    if (subscriptionPlanId) {
+    if (subscriptionPlanId || autoProvision.subscriptionPlanId) {
       subApi.listPlans().then((res) => {
         const plan = res.data.find((p: { id: string }) => p.id === subscriptionPlanId);
         if (plan) setPlanName(plan.name);
       }).catch(() => {});
     }
-  }, [subscriptionPlanId]);
+  }, [subscriptionPlanId, autoProvision.subscriptionPlanId]);
+
+  useEffect(() => {
+    if (autoProvision.roleIds.length > 0) {
+      roleApi.list().then((res) => {
+        const map = new Map<string, string>();
+        res.data.forEach((r: { id: string; name: string }) => map.set(r.id, r.name));
+        setRoleNames(map);
+      }).catch(() => {});
+    }
+  }, [autoProvision.roleIds]);
+
+  useEffect(() => {
+    if (autoProvision.permissionIds.length > 0) {
+      permissionApi.list().then((res) => {
+        const map = new Map<string, string>();
+        res.data.forEach((p: { id: string; name: string }) => map.set(p.id, p.name));
+        setPermissionNames(map);
+      }).catch(() => {});
+    }
+  }, [autoProvision.permissionIds]);
 
   return (
     <Descriptions column={1} bordered size="small">
@@ -109,6 +131,44 @@ const ReviewStep: React.FC<ReviewStepProps> = ({ wizardData }) => {
           <Tag color="purple">{planName || subscriptionPlanId}</Tag>
         ) : (
           <Text type="secondary">未配置</Text>
+        )}
+      </Descriptions.Item>
+
+      <Descriptions.Item label="自动配置">
+        {autoProvision.enabled ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <Tag color="green">已启用</Tag>
+            {autoProvision.roleIds.length > 0 && (
+              <div>
+                <Text type="secondary">角色：</Text>
+                {autoProvision.roleIds.map((id) => (
+                  <Tag key={id}>{roleNames.get(id) || id}</Tag>
+                ))}
+              </div>
+            )}
+            {autoProvision.permissionIds.length > 0 && (
+              <div>
+                <Text type="secondary">权限：</Text>
+                {autoProvision.permissionIds.map((id) => (
+                  <Tag key={id}>{permissionNames.get(id) || id}</Tag>
+                ))}
+              </div>
+            )}
+            {autoProvision.organizationId && (
+              <div>
+                <Text type="secondary">组织：</Text>
+                <Tag color="cyan">{orgNames.get(autoProvision.organizationId) || autoProvision.organizationId}</Tag>
+              </div>
+            )}
+            {autoProvision.subscriptionPlanId && (
+              <div>
+                <Text type="secondary">订阅计划：</Text>
+                <Tag color="purple">{autoProvision.subscriptionPlanId}</Tag>
+              </div>
+            )}
+          </div>
+        ) : (
+          <Text type="secondary">未启用</Text>
         )}
       </Descriptions.Item>
     </Descriptions>

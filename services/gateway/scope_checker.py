@@ -22,8 +22,11 @@ ENDPOINT_SCOPE_MAP = {
     "auth/oauth/*": "auth:login",
     "auth/refresh": "auth:login",
     "auth/change-password": "user:write",
-    "users/*/roles": "role:read",
+    "users/*/roles/assign": "role:write",
+    "users/*/roles/*/remove": "role:write",
+    "users/*/permissions": "role:read",
     "users/*/permissions/check": "role:read",
+    "users/*/roles": "role:read",
     "users/*": "user:read",
 }
 

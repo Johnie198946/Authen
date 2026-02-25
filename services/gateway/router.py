@@ -21,6 +21,7 @@ DEFAULT_SERVICE_URLS = {
     "sso": "http://localhost:8002",
     "user": "http://localhost:8003",
     "permission": "http://localhost:8004",
+    "llm": "http://localhost:8010",
 }
 
 # 统一超时（秒）

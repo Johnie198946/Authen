@@ -7,6 +7,7 @@ import ScopesStep from './ScopesStep';
 import RateLimitStep from './RateLimitStep';
 import OrganizationStep from './OrganizationStep';
 import SubscriptionStep from './SubscriptionStep';
+import AutoProvisionStep from './AutoProvisionStep';
 import ReviewStep from './ReviewStep';
 import { submitWizard } from './submitWizard';
 import { INITIAL_WIZARD_DATA, WIZARD_STEPS } from './types';
@@ -47,6 +48,7 @@ const AppConfigWizard: React.FC<AppConfigWizardProps> = ({ open, onClose, onSucc
       scopes: [],
       organizations: [],
       subscriptionPlanId: '',
+      autoProvision: { ...INITIAL_WIZARD_DATA.autoProvision },
     });
     setLoading(false);
   }, []);
@@ -149,6 +151,13 @@ const AppConfigWizard: React.FC<AppConfigWizardProps> = ({ open, onClose, onSucc
           />
         );
       case 6:
+        return (
+          <AutoProvisionStep
+            data={wizardData.autoProvision}
+            onChange={(autoProvision) => setWizardData((prev) => ({ ...prev, autoProvision }))}
+          />
+        );
+      case 7:
         return <ReviewStep wizardData={wizardData} />;
       default:
         return null;

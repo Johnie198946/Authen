@@ -2,11 +2,14 @@ import { useEffect, useState, useCallback } from 'react';
 import {
   Card, Descriptions, Tag, Button, Space, Switch, Input, InputNumber,
   Checkbox, message, Popconfirm, Typography, Spin, Divider, Tree, Radio,
+  Select, TreeSelect, Collapse,
 } from 'antd';
-import { ArrowLeftOutlined, CopyOutlined, KeyOutlined, SaveOutlined } from '@ant-design/icons';
-import { applicationApi, orgApi, subApi } from '../../api/services';
+import { ArrowLeftOutlined, CopyOutlined, KeyOutlined, SaveOutlined, ReloadOutlined, FileTextOutlined } from '@ant-design/icons';
+import { applicationApi, orgApi, subApi, roleApi, permissionApi } from '../../api/services';
 import { useAuth } from '../../store/AuthContext';
 import type { DataNode } from 'antd/es/tree';
+import WebhookEventsPanel from './WebhookEventsPanel';
+import IntegrationGuide from './IntegrationGuide';
 
 const { Paragraph } = Typography;
 
@@ -74,12 +77,28 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
   const [selectedPlanId, setSelectedPlanId] = useState<string>('');
   const [savingPlan, setSavingPlan] = useState(false);
 
+  // Auto-provision
+  const [autoProvisionEnabled, setAutoProvisionEnabled] = useState(false);
+  const [selectedRoleIds, setSelectedRoleIds] = useState<string[]>([]);
+  const [selectedPermissionIds, setSelectedPermissionIds] = useState<string[]>([]);
+  const [selectedOrgId, setSelectedOrgId] = useState<string | undefined>();
+  const [selectedAutoProvisionPlanId, setSelectedAutoProvisionPlanId] = useState<string | undefined>();
+  const [savingAutoProvision, setSavingAutoProvision] = useState(false);
+  const [allRoles, setAllRoles] = useState<{ id: string; name: string }[]>([]);
+  const [allPermissions, setAllPermissions] = useState<{ id: string; name: string }[]>([]);
+  const [permDropdownOpen, setPermDropdownOpen] = useState(false);
+
+  // Webhook secret
+  const [webhookSecret, setWebhookSecret] = useState('');
+  const [resettingWebhookSecret, setResettingWebhookSecret] = useState(false);
+
   // ===== Fetch data =====
   const fetchApp = useCallback(async () => {
     try {
       const { data } = await applicationApi.get(appId, userId);
       setApp(data);
       setRateLimit(data.rate_limit ?? 60);
+      setWebhookSecret(data.webhook_secret || '');
     } catch {
       message.error('获取应用详情失败');
     }
@@ -158,13 +177,44 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
     }
   }, [appId, userId]);
 
+  const fetchAutoProvision = useCallback(async () => {
+    try {
+      const { data } = await applicationApi.getAutoProvision(appId, userId);
+      setAutoProvisionEnabled(data.is_enabled ?? false);
+      setSelectedRoleIds(data.role_ids || []);
+      setSelectedPermissionIds(data.permission_ids || []);
+      setSelectedOrgId(data.organization_id || undefined);
+      setSelectedAutoProvisionPlanId(data.subscription_plan_id || undefined);
+    } catch {
+      // auto-provision config may not exist yet
+    }
+  }, [appId, userId]);
+
+  const fetchRoles = useCallback(async () => {
+    try {
+      const { data } = await roleApi.list();
+      setAllRoles(Array.isArray(data) ? data : data.roles || []);
+    } catch {
+      // role service may not be running
+    }
+  }, []);
+
+  const fetchPermissions = useCallback(async () => {
+    try {
+      const { data } = await permissionApi.list();
+      setAllPermissions(Array.isArray(data) ? data : data.permissions || []);
+    } catch {
+      // permission service may not be running
+    }
+  }, []);
+
   useEffect(() => {
     if (!userId) return;
     setLoading(true);
-    Promise.all([fetchApp(), fetchLoginMethods(), fetchScopes(), fetchOrganizations(), fetchSubscriptionPlan()]).finally(() =>
+    Promise.all([fetchApp(), fetchLoginMethods(), fetchScopes(), fetchOrganizations(), fetchSubscriptionPlan(), fetchAutoProvision(), fetchRoles(), fetchPermissions()]).finally(() =>
       setLoading(false),
     );
-  }, [fetchApp, fetchLoginMethods, fetchScopes, fetchOrganizations, fetchSubscriptionPlan, userId]);
+  }, [fetchApp, fetchLoginMethods, fetchScopes, fetchOrganizations, fetchSubscriptionPlan, fetchAutoProvision, fetchRoles, fetchPermissions, userId]);
 
   // ===== Login methods handlers =====
   const handleMethodToggle = (method: string, checked: boolean) => {
@@ -239,6 +289,20 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
     }
   };
 
+  // ===== Reset webhook secret =====
+  const handleResetWebhookSecret = async () => {
+    setResettingWebhookSecret(true);
+    try {
+      const { data } = await applicationApi.resetWebhookSecret(appId);
+      setWebhookSecret(data.webhook_secret);
+      message.success('Webhook 密钥已重置');
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || '重置 Webhook 密钥失败');
+    } finally {
+      setResettingWebhookSecret(false);
+    }
+  };
+
   // ===== Organizations handlers =====
   const saveOrganizations = async () => {
     setSavingOrgs(true);
@@ -262,6 +326,43 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
       message.error(err.response?.data?.detail || '更新订阅计划失败');
     } finally {
       setSavingPlan(false);
+    }
+  };
+
+  // ===== Auto-provision handlers =====
+  const saveAutoProvision = async () => {
+    setSavingAutoProvision(true);
+    try {
+      await applicationApi.updateAutoProvision(appId, {
+        role_ids: selectedRoleIds,
+        permission_ids: selectedPermissionIds,
+        organization_id: selectedOrgId || undefined,
+        subscription_plan_id: selectedAutoProvisionPlanId || undefined,
+        is_enabled: autoProvisionEnabled,
+      }, userId);
+
+      // 当自动配置启用时，同步组织和订阅计划到各自的配置卡片
+      if (autoProvisionEnabled) {
+        try {
+          if (selectedOrgId) {
+            await applicationApi.updateOrganizations(appId, { organization_ids: [selectedOrgId] }, userId);
+            setSelectedOrgs([selectedOrgId]);
+          }
+          if (selectedAutoProvisionPlanId) {
+            await applicationApi.updateSubscriptionPlan(appId, { plan_id: selectedAutoProvisionPlanId }, userId);
+            setSelectedPlanId(selectedAutoProvisionPlanId);
+          }
+        } catch {
+          // 同步失败不影响主保存
+        }
+      }
+
+      message.success('自动配置保存成功');
+      await fetchAutoProvision();
+    } catch (error: any) {
+      message.error(error.response?.data?.detail || '保存失败');
+    } finally {
+      setSavingAutoProvision(false);
     }
   };
 
@@ -304,6 +405,24 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
           </Descriptions.Item>
         </Descriptions>
       </Card>
+
+      {/* API 对接说明 */}
+      <Collapse
+        style={{ marginBottom: 16 }}
+        items={[{
+          key: 'guide',
+          label: <><FileTextOutlined style={{ marginRight: 8 }} />API 对接说明</>,
+          children: (
+            <IntegrationGuide
+              appId={app?.app_id || appId}
+              appName={app?.name || ''}
+              scopes={scopes}
+              loginMethods={loginMethods}
+              rateLimit={rateLimit}
+            />
+          ),
+        }]}
+      />
 
       {/* Login methods */}
       <Card
@@ -398,10 +517,10 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
 
       {/* Organizations */}
       <Card
-        title="组织架构配置"
+        title={<>组织架构配置{autoProvisionEnabled && <Tag color="orange" style={{ marginLeft: 8 }}>自动配置已接管</Tag>}</>}
         style={{ marginBottom: 16 }}
         extra={
-          <Button type="primary" icon={<SaveOutlined />} loading={savingOrgs} onClick={saveOrganizations}>
+          <Button type="primary" icon={<SaveOutlined />} loading={savingOrgs} onClick={saveOrganizations} disabled={autoProvisionEnabled}>
             保存
           </Button>
         }
@@ -421,10 +540,10 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
 
       {/* Subscription plan */}
       <Card
-        title="订阅计划配置"
+        title={<>订阅计划配置{autoProvisionEnabled && <Tag color="orange" style={{ marginLeft: 8 }}>自动配置已接管</Tag>}</>}
         style={{ marginBottom: 16 }}
         extra={
-          <Button type="primary" icon={<SaveOutlined />} loading={savingPlan} onClick={saveSubscriptionPlan}>
+          <Button type="primary" icon={<SaveOutlined />} loading={savingPlan} onClick={saveSubscriptionPlan} disabled={autoProvisionEnabled}>
             保存
           </Button>
         }
@@ -443,6 +562,122 @@ export default function ApplicationDetail({ appId, onBack }: ApplicationDetailPr
             ))}
           </Space>
         </Radio.Group>
+      </Card>
+
+      {/* Auto-provision */}
+      <Card
+        title="用户自动配置"
+        style={{ marginBottom: 16 }}
+        extra={
+          <Button type="primary" icon={<SaveOutlined />} loading={savingAutoProvision} onClick={saveAutoProvision}>
+            保存
+          </Button>
+        }
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+          <div>
+            <span style={{ marginRight: 12 }}>启用自动配置：</span>
+            <Switch checked={autoProvisionEnabled} onChange={setAutoProvisionEnabled} />
+          </div>
+          <div>
+            <div style={{ marginBottom: 4 }}>角色分配：</div>
+            <Select
+              mode="multiple"
+              placeholder="选择要自动分配的角色"
+              value={selectedRoleIds}
+              onChange={setSelectedRoleIds}
+              style={{ width: '100%', maxWidth: 480 }}
+              options={allRoles.map((r) => ({ label: r.name, value: r.id }))}
+            />
+          </div>
+          <div>
+            <div style={{ marginBottom: 4 }}>权限分配：</div>
+            <Select
+              mode="multiple"
+              placeholder="选择要自动分配的权限"
+              value={selectedPermissionIds}
+              onChange={setSelectedPermissionIds}
+              style={{ width: '100%', maxWidth: 480 }}
+              options={allPermissions.map((p) => ({ label: p.name, value: p.id }))}
+              open={permDropdownOpen}
+              onDropdownVisibleChange={setPermDropdownOpen}
+              dropdownRender={(menu) => (
+                <div>
+                  {menu}
+                  <Divider style={{ margin: '4px 0' }} />
+                  <div style={{ padding: '4px 8px', textAlign: 'right' }}>
+                    <Button type="link" size="small" onClick={() => setPermDropdownOpen(false)}>
+                      确认
+                    </Button>
+                  </div>
+                </div>
+              )}
+            />
+          </div>
+          <div>
+            <div style={{ marginBottom: 4 }}>目标组织：</div>
+            <TreeSelect
+              placeholder="选择目标组织"
+              value={selectedOrgId}
+              onChange={setSelectedOrgId}
+              treeData={orgTreeData}
+              allowClear
+              style={{ width: '100%', maxWidth: 480 }}
+              treeDefaultExpandAll
+            />
+          </div>
+          <div>
+            <div style={{ marginBottom: 4 }}>订阅计划：</div>
+            <Radio.Group value={selectedAutoProvisionPlanId || ''} onChange={(e) => setSelectedAutoProvisionPlanId(e.target.value || undefined)}>
+              <Space direction="vertical">
+                <Radio value="">不绑定订阅计划</Radio>
+                {plans.map((plan) => (
+                  <Radio key={plan.id} value={plan.id}>
+                    <Space>
+                      <span>{plan.name}</span>
+                      <Tag color="blue">{plan.duration_days}天</Tag>
+                      <Tag color="green">¥{plan.price}</Tag>
+                    </Space>
+                  </Radio>
+                ))}
+              </Space>
+            </Radio.Group>
+          </div>
+        </Space>
+      </Card>
+
+      {/* Webhook 事件 */}
+      <Card title="Webhook 事件" style={{ marginBottom: 16 }}>
+        <div style={{ marginBottom: 16 }}>
+          <Descriptions column={1} bordered size="small">
+            <Descriptions.Item label="Webhook Secret">
+              <Space>
+                <Paragraph copyable={{ icon: <CopyOutlined /> }} style={{ marginBottom: 0, wordBreak: 'break-all' }}>
+                  {webhookSecret || '未生成'}
+                </Paragraph>
+                <Popconfirm
+                  title="确定重置 Webhook 密钥？"
+                  description="重置后旧密钥将立即失效，使用旧密钥的第三方系统签名验证将失败。"
+                  onConfirm={handleResetWebhookSecret}
+                  okText="确定重置"
+                  cancelText="取消"
+                  okButtonProps={{ danger: true }}
+                >
+                  <Button
+                    size="small"
+                    danger
+                    icon={<ReloadOutlined />}
+                    loading={resettingWebhookSecret}
+                  >
+                    重置密钥
+                  </Button>
+                </Popconfirm>
+              </Space>
+            </Descriptions.Item>
+          </Descriptions>
+        </div>
+        <Divider />
+        <WebhookEventsPanel appId={app?.app_id || appId} />
       </Card>
 
       {/* Danger zone */}

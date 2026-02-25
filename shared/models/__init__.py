@@ -7,6 +7,8 @@ from shared.models.organization import Organization, UserOrganization, Organizat
 from shared.models.subscription import SubscriptionPlan, UserSubscription
 from shared.models.system import CloudServiceConfig, MessageTemplate, AuditLog
 from shared.models.application import Application, AppLoginMethod, AppScope, AppUser
+from shared.models.quota import AppQuotaOverride, QuotaUsage
+from shared.models.webhook import WebhookEventLog
 
 __all__ = [
     "User",
@@ -29,4 +31,7 @@ __all__ = [
     "AppLoginMethod",
     "AppScope",
     "AppUser",
+    "AppQuotaOverride",
+    "QuotaUsage",
+    "WebhookEventLog",
 ]

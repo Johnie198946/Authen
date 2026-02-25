@@ -7,6 +7,14 @@ export interface LoginMethodConfig {
   client_secret: string;
 }
 
+export interface AutoProvisionData {
+  enabled: boolean;
+  roleIds: string[];
+  permissionIds: string[];
+  organizationId?: string;
+  subscriptionPlanId?: string;
+}
+
 export interface WizardData {
   basicInfo: {
     name: string;
@@ -17,6 +25,7 @@ export interface WizardData {
   rateLimit: number;
   organizations: string[];
   subscriptionPlanId: string;
+  autoProvision: AutoProvisionData;
 }
 
 export interface WizardStep {
@@ -38,6 +47,13 @@ export const INITIAL_WIZARD_DATA: WizardData = {
   rateLimit: 60,
   organizations: [],
   subscriptionPlanId: '',
+  autoProvision: {
+    enabled: false,
+    roleIds: [],
+    permissionIds: [],
+    organizationId: undefined,
+    subscriptionPlanId: undefined,
+  },
 };
 
 export const WIZARD_STEPS = [
@@ -47,6 +63,7 @@ export const WIZARD_STEPS = [
   { title: '限流配置', key: 'rateLimit' },
   { title: '组织架构', key: 'organizations' },
   { title: '订阅计划', key: 'subscriptionPlan' },
+  { title: '自动配置', key: 'autoProvision' },
   { title: '确认创建', key: 'review' },
 ] as const;
 

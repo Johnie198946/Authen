@@ -5,7 +5,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -18,7 +18,7 @@ import secrets
 
 from shared.database import get_db
 from shared.models.system import CloudServiceConfig
-from shared.models.application import Application, AppLoginMethod, AppScope, AppUser, AppOrganization, AppSubscriptionPlan
+from shared.models.application import Application, AppLoginMethod, AppScope, AppUser, AppOrganization, AppSubscriptionPlan, AutoProvisionConfig
 from shared.utils.crypto import encrypt_config, decrypt_config, hash_password, verify_password
 from shared.config import settings
 from shared.middleware.api_logger import APILoggerMiddleware
@@ -515,23 +515,43 @@ def is_super_admin(user_id: str, db: Session) -> bool:
     return user_role is not None
 
 
-def require_super_admin(user_id: str = Query(..., description="当前用户ID"), db: Session = Depends(get_db)):
+def _extract_user_id_from_token(request: Request) -> Optional[str]:
+    """从请求的Authorization头中解析JWT token获取user_id"""
+    from shared.utils.jwt import decode_token
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        payload = decode_token(token)
+        if payload and "sub" in payload:
+            return payload["sub"]
+    return None
+
+
+def require_super_admin(
+    request: Request,
+    user_id: Optional[str] = Query(None, description="当前用户ID"),
+    db: Session = Depends(get_db)
+):
     """
     要求超级管理员权限的依赖项
-    
-    Args:
-        user_id: 用户ID
-        db: 数据库会话
-        
-    Raises:
-        HTTPException: 如果不是超级管理员
+    优先从JWT token中获取user_id，其次使用query参数
     """
-    if not is_super_admin(user_id, db):
+    # 优先从JWT token中提取user_id
+    token_user_id = _extract_user_id_from_token(request)
+    effective_user_id = token_user_id or user_id
+    
+    if not effective_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="未提供有效的身份认证信息"
+        )
+    
+    if not is_super_admin(effective_user_id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有超级管理员可以访问此接口"
         )
-    return user_id
+    return effective_user_id
 
 
 # ==================== API端点 ====================
@@ -668,6 +688,7 @@ async def list_cloud_service_configs(
 @app.post("/api/v1/admin/cloud-services", response_model=CloudServiceConfigResponse, status_code=status.HTTP_201_CREATED)
 async def create_cloud_service_config(
     request: CloudServiceConfigCreate,
+    skip_validation: bool = Query(False, description="跳过连接验证，仅保存配置"),
     user_id: str = Depends(require_super_admin),
     db: Session = Depends(get_db)
 ):
@@ -708,17 +729,18 @@ async def create_cloud_service_config(
         )
     
     # 验证配置有效性（需求 8.5）
-    is_valid, error_message = validate_cloud_service_config(
-        request.service_type,
-        request.provider,
-        request.config
-    )
-    
-    if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"配置验证失败: {error_message}"
+    if not skip_validation:
+        is_valid, error_message = validate_cloud_service_config(
+            request.service_type,
+            request.provider,
+            request.config
         )
+        
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"配置验证失败: {error_message}"
+            )
     
     # 加密配置数据
     try:
@@ -757,6 +779,7 @@ async def create_cloud_service_config(
 async def update_cloud_service_config(
     config_id: str,
     request: CloudServiceConfigUpdate,
+    skip_validation: bool = Query(False, description="跳过连接验证，仅保存配置"),
     user_id: str = Depends(require_super_admin),
     db: Session = Depends(get_db)
 ):
@@ -797,17 +820,18 @@ async def update_cloud_service_config(
     # 更新配置
     if request.config is not None:
         # 验证新配置的有效性（需求 8.5）
-        is_valid, error_message = validate_cloud_service_config(
-            config.service_type,
-            config.provider,
-            request.config
-        )
-        
-        if not is_valid:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"配置验证失败: {error_message}"
+        if not skip_validation:
+            is_valid, error_message = validate_cloud_service_config(
+                config.service_type,
+                config.provider,
+                request.config
             )
+            
+            if not is_valid:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"配置验证失败: {error_message}"
+                )
         
         try:
             # 加密新配置
@@ -1848,6 +1872,7 @@ class ApplicationResponse(BaseModel):
     app_id: str
     status: str
     rate_limit: int
+    webhook_secret: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -1870,6 +1895,13 @@ class ResetSecretResponse(BaseModel):
     """重置密钥响应"""
     app_id: str
     app_secret: str
+    message: str
+
+
+class ResetWebhookSecretResponse(BaseModel):
+    """重置 Webhook 密钥响应"""
+    app_id: str
+    webhook_secret: str
     message: str
 
 
@@ -1903,6 +1935,7 @@ async def create_application(
         app_secret_hash=secret_hash,
         status="active",
         rate_limit=60,
+        webhook_secret=secrets.token_hex(32),
     )
 
     db.add(new_app)
@@ -1916,6 +1949,7 @@ async def create_application(
         app_id=new_app.app_id,
         status=new_app.status,
         rate_limit=new_app.rate_limit,
+        webhook_secret=new_app.webhook_secret,
         created_at=new_app.created_at,
         updated_at=new_app.updated_at,
         app_secret=app_secret,
@@ -1951,6 +1985,7 @@ async def list_applications(
             app_id=a.app_id,
             status=a.status,
             rate_limit=a.rate_limit,
+            webhook_secret=a.webhook_secret,
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1985,6 +2020,7 @@ async def get_application(
         app_id=application.app_id,
         status=application.status,
         rate_limit=application.rate_limit,
+        webhook_secret=application.webhook_secret,
         created_at=application.created_at,
         updated_at=application.updated_at,
     )
@@ -2035,6 +2071,7 @@ async def update_application(
         app_id=application.app_id,
         status=application.status,
         rate_limit=application.rate_limit,
+        webhook_secret=application.webhook_secret,
         created_at=application.created_at,
         updated_at=application.updated_at,
     )
@@ -2114,6 +2151,38 @@ async def reset_application_secret(
     )
 
 
+@app.post("/api/v1/admin/applications/{app_id}/reset-webhook-secret", response_model=ResetWebhookSecretResponse)
+async def reset_webhook_secret(
+    app_id: str,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    重置应用 Webhook 密钥
+
+    生成新的 webhook_secret 并使旧密钥立即失效。新密钥仅返回一次。
+
+    需求: 1.1
+    """
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="应用不存在"
+        )
+
+    application.webhook_secret = secrets.token_hex(32)
+
+    db.commit()
+    db.refresh(application)
+
+    return ResetWebhookSecretResponse(
+        app_id=app_id,
+        webhook_secret=application.webhook_secret,
+        message="Webhook 密钥已重置，请妥善保管新密钥",
+    )
+
+
 @app.put("/api/v1/admin/applications/{app_id}/status", response_model=ApplicationResponse)
 async def update_application_status(
     app_id: str,
@@ -2160,6 +2229,7 @@ async def update_application_status(
         app_id=application.app_id,
         status=application.status,
         rate_limit=application.rate_limit,
+        webhook_secret=application.webhook_secret,
         created_at=application.created_at,
         updated_at=application.updated_at,
     )
@@ -2619,6 +2689,786 @@ async def update_app_subscription_plan(
 
     binding = db.query(AppSubscriptionPlan).filter(AppSubscriptionPlan.application_id == application.id).first()
     return SubscriptionPlanBindingResponse(app_id=app_id, plan_id=str(binding.plan_id) if binding else None)
+
+
+# ==================== 自动配置规则 Pydantic 模型 ====================
+
+class AutoProvisionConfigUpdate(BaseModel):
+    """自动配置规则更新请求"""
+    role_ids: Optional[List[str]] = None
+    permission_ids: Optional[List[str]] = None
+    organization_id: Optional[str] = None
+    subscription_plan_id: Optional[str] = None
+    is_enabled: bool = True
+
+
+class AutoProvisionConfigResponse(BaseModel):
+    """自动配置规则响应"""
+    application_id: str
+    role_ids: List[str]
+    permission_ids: List[str]
+    organization_id: Optional[str]
+    subscription_plan_id: Optional[str]
+    is_enabled: bool
+    created_at: str
+    updated_at: str
+
+
+# ==================== 自动配置规则 API 端点 ====================
+
+@app.get("/api/v1/admin/applications/{app_id}/auto-provision", response_model=AutoProvisionConfigResponse)
+async def get_auto_provision_config(
+    app_id: str,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    获取应用自动配置规则
+
+    不存在时返回默认空配置。
+
+    需求: 2.1
+    """
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="应用不存在"
+        )
+
+    config = db.query(AutoProvisionConfig).filter(
+        AutoProvisionConfig.application_id == application.id
+    ).first()
+
+    if config:
+        return AutoProvisionConfigResponse(
+            application_id=app_id,
+            role_ids=[str(rid) for rid in (config.role_ids or [])],
+            permission_ids=[str(pid) for pid in (config.permission_ids or [])],
+            organization_id=str(config.organization_id) if config.organization_id else None,
+            subscription_plan_id=str(config.subscription_plan_id) if config.subscription_plan_id else None,
+            is_enabled=config.is_enabled,
+            created_at=config.created_at.isoformat(),
+            updated_at=config.updated_at.isoformat(),
+        )
+
+    # 返回默认空配置
+    now = datetime.utcnow().isoformat()
+    return AutoProvisionConfigResponse(
+        application_id=app_id,
+        role_ids=[],
+        permission_ids=[],
+        organization_id=None,
+        subscription_plan_id=None,
+        is_enabled=False,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@app.put("/api/v1/admin/applications/{app_id}/auto-provision", response_model=AutoProvisionConfigResponse)
+async def update_auto_provision_config(
+    app_id: str,
+    request: AutoProvisionConfigUpdate,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    创建或更新应用自动配置规则
+
+    校验所有引用 ID 的有效性，校验失败返回 400。
+
+    需求: 2.2, 2.4, 2.5, 2.6, 2.7
+    """
+    from shared.models.permission import Role, Permission
+    from shared.models.organization import Organization
+    from shared.models.subscription import SubscriptionPlan
+
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="应用不存在"
+        )
+
+    errors = []
+
+    # 校验 role_ids
+    role_uuids = []
+    if request.role_ids:
+        for rid in request.role_ids:
+            try:
+                role_uuids.append(uuid.UUID(rid))
+            except ValueError:
+                errors.append(f"无效的角色ID格式: {rid}")
+        if not errors:
+            existing_roles = db.query(Role.id).filter(Role.id.in_(role_uuids)).all()
+            existing_role_ids = {r.id for r in existing_roles}
+            invalid_roles = [str(rid) for rid in role_uuids if rid not in existing_role_ids]
+            if invalid_roles:
+                errors.append(f"不存在的角色ID: {', '.join(invalid_roles)}")
+
+    # 校验 permission_ids
+    perm_uuids = []
+    if request.permission_ids:
+        for pid in request.permission_ids:
+            try:
+                perm_uuids.append(uuid.UUID(pid))
+            except ValueError:
+                errors.append(f"无效的权限ID格式: {pid}")
+        if not errors:
+            existing_perms = db.query(Permission.id).filter(Permission.id.in_(perm_uuids)).all()
+            existing_perm_ids = {p.id for p in existing_perms}
+            invalid_perms = [str(pid) for pid in perm_uuids if pid not in existing_perm_ids]
+            if invalid_perms:
+                errors.append(f"不存在的权限ID: {', '.join(invalid_perms)}")
+
+    # 校验 organization_id
+    org_uuid = None
+    if request.organization_id:
+        try:
+            org_uuid = uuid.UUID(request.organization_id)
+        except ValueError:
+            errors.append(f"无效的组织ID格式: {request.organization_id}")
+        if org_uuid and not errors:
+            org = db.query(Organization).filter(Organization.id == org_uuid).first()
+            if not org:
+                errors.append(f"不存在的组织ID: {request.organization_id}")
+
+    # 校验 subscription_plan_id
+    plan_uuid = None
+    if request.subscription_plan_id:
+        try:
+            plan_uuid = uuid.UUID(request.subscription_plan_id)
+        except ValueError:
+            errors.append(f"无效的订阅计划ID格式: {request.subscription_plan_id}")
+        if plan_uuid and not errors:
+            plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == plan_uuid).first()
+            if not plan:
+                errors.append(f"不存在的订阅计划ID: {request.subscription_plan_id}")
+
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="; ".join(errors)
+        )
+
+    # 查找或创建配置
+    config = db.query(AutoProvisionConfig).filter(
+        AutoProvisionConfig.application_id == application.id
+    ).first()
+
+    role_ids_list = [str(rid) for rid in role_uuids] if request.role_ids else []
+    perm_ids_list = [str(pid) for pid in perm_uuids] if request.permission_ids else []
+
+    if config:
+        config.role_ids = role_ids_list
+        config.permission_ids = perm_ids_list
+        config.organization_id = org_uuid
+        config.subscription_plan_id = plan_uuid
+        config.is_enabled = request.is_enabled
+        config.updated_at = datetime.utcnow()
+    else:
+        config = AutoProvisionConfig(
+            application_id=application.id,
+            role_ids=role_ids_list,
+            permission_ids=perm_ids_list,
+            organization_id=org_uuid,
+            subscription_plan_id=plan_uuid,
+            is_enabled=request.is_enabled,
+        )
+        db.add(config)
+
+    db.commit()
+    db.refresh(config)
+
+    return AutoProvisionConfigResponse(
+        application_id=app_id,
+        role_ids=[str(rid) for rid in (config.role_ids or [])],
+        permission_ids=[str(pid) for pid in (config.permission_ids or [])],
+        organization_id=str(config.organization_id) if config.organization_id else None,
+        subscription_plan_id=str(config.subscription_plan_id) if config.subscription_plan_id else None,
+        is_enabled=config.is_enabled,
+        created_at=config.created_at.isoformat(),
+        updated_at=config.updated_at.isoformat(),
+    )
+
+
+@app.delete("/api/v1/admin/applications/{app_id}/auto-provision")
+async def delete_auto_provision_config(
+    app_id: str,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db)
+):
+    """
+    删除应用自动配置规则
+
+    需求: 2.3
+    """
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="应用不存在"
+        )
+
+    config = db.query(AutoProvisionConfig).filter(
+        AutoProvisionConfig.application_id == application.id
+    ).first()
+
+    if config:
+        db.delete(config)
+        db.commit()
+
+    return {"success": True, "message": "自动配置规则已删除"}
+
+@app.get("/api/v1/admin/webhook-events")
+async def admin_list_webhook_events(
+    app_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    status: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """
+    管理端点：代理调用订阅服务的事件日志查询接口
+
+    需求: 7.1
+    """
+    params = {}
+    if app_id is not None:
+        params["app_id"] = app_id
+    if event_type is not None:
+        params["event_type"] = event_type
+    if status is not None:
+        params["status"] = status
+    if start_time is not None:
+        params["start_time"] = start_time
+    if end_time is not None:
+        params["end_time"] = end_time
+    params["page"] = page
+    params["page_size"] = page_size
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "http://localhost:8006/api/v1/webhooks/events",
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=502,
+            detail="订阅服务请求超时",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=e.response.text,
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="无法连接到订阅服务",
+        )
+
+
+
+# ==================== 配额管理 Pydantic 模型 ====================
+
+class QuotaOverviewItem(BaseModel):
+    """配额概览条目"""
+    app_id: str
+    app_name: str
+    request_quota_limit: int
+    request_quota_used: int
+    request_quota_remaining: int
+    token_quota_limit: int
+    token_quota_used: int
+    token_quota_remaining: int
+    request_usage_rate: float  # 0.0 ~ 1.0
+    token_usage_rate: float
+    billing_cycle_start: Optional[str]
+    billing_cycle_end: Optional[str]
+
+class QuotaOverviewResponse(BaseModel):
+    """配额概览响应"""
+    items: List[QuotaOverviewItem]
+    total: int
+
+class QuotaDetailResponse(BaseModel):
+    """单个应用配额详情"""
+    app_id: str
+    app_name: str
+    request_quota_limit: int
+    request_quota_used: int
+    request_quota_remaining: int
+    token_quota_limit: int
+    token_quota_used: int
+    token_quota_remaining: int
+    request_usage_rate: float
+    token_usage_rate: float
+    billing_cycle_start: Optional[str]
+    billing_cycle_end: Optional[str]
+    has_override: bool
+    override_request_quota: Optional[int]
+    override_token_quota: Optional[int]
+    plan_name: Optional[str]
+    plan_request_quota: Optional[int]
+    plan_token_quota: Optional[int]
+    quota_period_days: Optional[int]
+
+class QuotaOverrideRequest(BaseModel):
+    """配额覆盖请求"""
+    request_quota: Optional[int] = Field(None, description="请求次数配额，NULL 使用计划默认值，-1 无限制")
+    token_quota: Optional[int] = Field(None, description="Token 配额，NULL 使用计划默认值，-1 无限制")
+
+class QuotaHistoryItem(BaseModel):
+    """配额历史条目"""
+    id: str
+    billing_cycle_start: str
+    billing_cycle_end: str
+    request_quota_limit: int
+    request_quota_used: int
+    token_quota_limit: int
+    token_quota_used: int
+    reset_type: str
+    created_at: str
+
+class QuotaHistoryResponse(BaseModel):
+    """配额历史响应"""
+    items: List[QuotaHistoryItem]
+    total: int
+    page: int
+    page_size: int
+
+
+def _compute_usage_rate(used: int, limit: int) -> float:
+    """计算使用率"""
+    if limit == -1:
+        return 0.0
+    if limit == 0:
+        return 1.0 if used > 0 else 0.0
+    return min(used / limit, 1.0)
+
+
+def _compute_remaining(limit: int, used: int) -> int:
+    """计算剩余量"""
+    if limit == -1:
+        return -1
+    return max(0, limit - used)
+
+
+async def _get_app_quota_from_redis(app_id: str) -> dict:
+    """从 Redis 读取应用的实时配额数据"""
+    try:
+        from shared.redis_client import get_redis
+        r = get_redis()
+        requests_used = int(r.get(f"quota:{app_id}:requests") or 0)
+        tokens_used = int(float(r.get(f"quota:{app_id}:tokens") or 0))
+        cycle_start = r.get(f"quota:{app_id}:cycle_start")
+        config_data = r.hgetall(f"quota:{app_id}:config")
+        return {
+            "requests_used": requests_used,
+            "tokens_used": tokens_used,
+            "cycle_start": cycle_start,
+            "config": config_data,
+        }
+    except Exception:
+        return {
+            "requests_used": 0,
+            "tokens_used": 0,
+            "cycle_start": None,
+            "config": {},
+        }
+
+
+async def _get_effective_quota(app: Application, db: Session) -> dict:
+    """获取应用的有效配额配置（覆盖优先于计划）"""
+    from shared.models.quota import AppQuotaOverride
+    from shared.models.subscription import SubscriptionPlan
+
+    override = db.query(AppQuotaOverride).filter(
+        AppQuotaOverride.application_id == app.id
+    ).first()
+
+    binding = db.query(AppSubscriptionPlan).filter(
+        AppSubscriptionPlan.application_id == app.id
+    ).first()
+
+    plan = None
+    if binding:
+        plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == binding.plan_id).first()
+
+    plan_request_quota = plan.request_quota if plan else None
+    plan_token_quota = plan.token_quota if plan else None
+    quota_period_days = plan.quota_period_days if plan else None
+
+    effective_request = (override.request_quota if override and override.request_quota is not None
+                         else plan_request_quota if plan_request_quota is not None else 0)
+    effective_token = (override.token_quota if override and override.token_quota is not None
+                       else plan_token_quota if plan_token_quota is not None else 0)
+
+    return {
+        "effective_request_quota": effective_request,
+        "effective_token_quota": effective_token,
+        "plan_name": plan.name if plan else None,
+        "plan_request_quota": plan_request_quota,
+        "plan_token_quota": plan_token_quota,
+        "quota_period_days": quota_period_days,
+        "has_override": override is not None,
+        "override_request_quota": override.request_quota if override else None,
+        "override_token_quota": override.token_quota if override else None,
+    }
+
+
+# ==================== 配额管理 API 端点 ====================
+
+@app.get("/api/v1/admin/quota/overview", response_model=QuotaOverviewResponse)
+async def quota_overview(
+    sort_by: Optional[str] = Query(None, description="排序字段: request_usage_rate / token_usage_rate"),
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """所有应用配额使用概览"""
+    applications = db.query(Application).filter(Application.status == "active").all()
+    items = []
+    for app_obj in applications:
+        redis_data = await _get_app_quota_from_redis(app_obj.app_id)
+        quota_info = await _get_effective_quota(app_obj, db)
+
+        req_limit = quota_info["effective_request_quota"]
+        tok_limit = quota_info["effective_token_quota"]
+        req_used = redis_data["requests_used"]
+        tok_used = redis_data["tokens_used"]
+
+        cycle_start_str = redis_data.get("cycle_start")
+        cycle_end_str = None
+        if cycle_start_str and quota_info["quota_period_days"]:
+            try:
+                from datetime import timedelta
+                cs = datetime.fromisoformat(cycle_start_str)
+                ce = cs + timedelta(days=quota_info["quota_period_days"])
+                cycle_end_str = ce.isoformat()
+            except Exception:
+                pass
+
+        items.append(QuotaOverviewItem(
+            app_id=app_obj.app_id,
+            app_name=app_obj.name,
+            request_quota_limit=req_limit,
+            request_quota_used=req_used,
+            request_quota_remaining=_compute_remaining(req_limit, req_used),
+            token_quota_limit=tok_limit,
+            token_quota_used=tok_used,
+            token_quota_remaining=_compute_remaining(tok_limit, tok_used),
+            request_usage_rate=_compute_usage_rate(req_used, req_limit),
+            token_usage_rate=_compute_usage_rate(tok_used, tok_limit),
+            billing_cycle_start=cycle_start_str,
+            billing_cycle_end=cycle_end_str,
+        ))
+
+    if sort_by == "request_usage_rate":
+        items.sort(key=lambda x: x.request_usage_rate, reverse=True)
+    elif sort_by == "token_usage_rate":
+        items.sort(key=lambda x: x.token_usage_rate, reverse=True)
+
+    return QuotaOverviewResponse(items=items, total=len(items))
+
+
+@app.get("/api/v1/admin/quota/{app_id}", response_model=QuotaDetailResponse)
+async def quota_detail(
+    app_id: str,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """单个应用配额详情"""
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="应用不存在")
+
+    redis_data = await _get_app_quota_from_redis(app_id)
+    quota_info = await _get_effective_quota(application, db)
+
+    req_limit = quota_info["effective_request_quota"]
+    tok_limit = quota_info["effective_token_quota"]
+    req_used = redis_data["requests_used"]
+    tok_used = redis_data["tokens_used"]
+
+    cycle_start_str = redis_data.get("cycle_start")
+    cycle_end_str = None
+    if cycle_start_str and quota_info["quota_period_days"]:
+        try:
+            from datetime import timedelta
+            cs = datetime.fromisoformat(cycle_start_str)
+            ce = cs + timedelta(days=quota_info["quota_period_days"])
+            cycle_end_str = ce.isoformat()
+        except Exception:
+            pass
+
+    return QuotaDetailResponse(
+        app_id=app_id,
+        app_name=application.name,
+        request_quota_limit=req_limit,
+        request_quota_used=req_used,
+        request_quota_remaining=_compute_remaining(req_limit, req_used),
+        token_quota_limit=tok_limit,
+        token_quota_used=tok_used,
+        token_quota_remaining=_compute_remaining(tok_limit, tok_used),
+        request_usage_rate=_compute_usage_rate(req_used, req_limit),
+        token_usage_rate=_compute_usage_rate(tok_used, tok_limit),
+        billing_cycle_start=cycle_start_str,
+        billing_cycle_end=cycle_end_str,
+        has_override=quota_info["has_override"],
+        override_request_quota=quota_info["override_request_quota"],
+        override_token_quota=quota_info["override_token_quota"],
+        plan_name=quota_info["plan_name"],
+        plan_request_quota=quota_info["plan_request_quota"],
+        plan_token_quota=quota_info["plan_token_quota"],
+        quota_period_days=quota_info["quota_period_days"],
+    )
+
+
+@app.put("/api/v1/admin/quota/{app_id}/override")
+async def quota_override(
+    app_id: str,
+    request_body: QuotaOverrideRequest,
+    request: Request,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """手动调整应用配额上限"""
+    from shared.models.quota import AppQuotaOverride
+    from shared.utils.audit_log import create_audit_log
+
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="应用不存在")
+
+    # 验证配额值
+    if request_body.request_quota is not None and request_body.request_quota < -1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error_code": "invalid_quota_value", "message": "request_quota 必须 >= -1"},
+        )
+    if request_body.token_quota is not None and request_body.token_quota < -1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error_code": "invalid_quota_value", "message": "token_quota 必须 >= -1"},
+        )
+
+    override = db.query(AppQuotaOverride).filter(
+        AppQuotaOverride.application_id == application.id
+    ).first()
+
+    old_values = {
+        "request_quota": override.request_quota if override else None,
+        "token_quota": override.token_quota if override else None,
+    }
+
+    if override:
+        if request_body.request_quota is not None:
+            override.request_quota = request_body.request_quota
+        if request_body.token_quota is not None:
+            override.token_quota = request_body.token_quota
+        override.updated_at = datetime.utcnow()
+    else:
+        override = AppQuotaOverride(
+            application_id=application.id,
+            request_quota=request_body.request_quota,
+            token_quota=request_body.token_quota,
+        )
+        db.add(override)
+
+    db.commit()
+
+    # 更新 Redis 配额配置缓存
+    try:
+        from shared.redis_client import get_redis
+        r = get_redis()
+        config_key = f"quota:{app_id}:config"
+        config_update = {}
+        if override.request_quota is not None:
+            config_update["request_quota"] = str(override.request_quota)
+        if override.token_quota is not None:
+            config_update["token_quota"] = str(override.token_quota)
+        if config_update:
+            r.hset(config_key, mapping=config_update)
+    except Exception:
+        pass  # Redis 更新失败不阻塞
+
+    new_values = {
+        "request_quota": override.request_quota,
+        "token_quota": override.token_quota,
+    }
+
+    # 记录审计日志
+    try:
+        uid = uuid.UUID(user_id) if user_id else None
+    except (ValueError, AttributeError):
+        uid = None
+    create_audit_log(
+        db=db,
+        user_id=uid,
+        action="quota_override",
+        resource_type="application",
+        resource_id=application.id,
+        details={
+            "app_id": app_id,
+            "old_values": old_values,
+            "new_values": new_values,
+            "operation": "override",
+        },
+    )
+
+    return {
+        "success": True,
+        "message": "配额覆盖已更新",
+        "old_values": old_values,
+        "new_values": new_values,
+    }
+
+
+@app.post("/api/v1/admin/quota/{app_id}/reset")
+async def quota_reset(
+    app_id: str,
+    request: Request,
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """手动重置应用配额"""
+    from shared.models.quota import QuotaUsage
+    from shared.utils.audit_log import create_audit_log
+
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="应用不存在")
+
+    # 从 Redis 读取当前使用数据
+    redis_data = await _get_app_quota_from_redis(app_id)
+    quota_info = await _get_effective_quota(application, db)
+
+    req_used = redis_data["requests_used"]
+    tok_used = redis_data["tokens_used"]
+    cycle_start_str = redis_data.get("cycle_start")
+
+    now = datetime.utcnow()
+    cycle_start = datetime.fromisoformat(cycle_start_str) if cycle_start_str else now
+
+    # 持久化当前使用数据到 QuotaUsage
+    usage_record = QuotaUsage(
+        application_id=application.id,
+        billing_cycle_start=cycle_start,
+        billing_cycle_end=now,
+        request_quota_limit=quota_info["effective_request_quota"],
+        request_quota_used=req_used,
+        token_quota_limit=quota_info["effective_token_quota"],
+        token_quota_used=tok_used,
+        reset_type="manual",
+    )
+    db.add(usage_record)
+    db.commit()
+
+    # 重置 Redis 计数器
+    try:
+        from shared.redis_client import get_redis
+        r = get_redis()
+        r.set(f"quota:{app_id}:requests", 0)
+        r.set(f"quota:{app_id}:tokens", 0)
+        r.set(f"quota:{app_id}:cycle_start", now.isoformat())
+        # 清除预警标记
+        r.delete(f"quota:{app_id}:warning_sent:80")
+        r.delete(f"quota:{app_id}:warning_sent:100")
+    except Exception:
+        pass  # Redis 重置失败不阻塞
+
+    # 记录审计日志
+    try:
+        uid = uuid.UUID(user_id) if user_id else None
+    except (ValueError, AttributeError):
+        uid = None
+    create_audit_log(
+        db=db,
+        user_id=uid,
+        action="quota_reset",
+        resource_type="application",
+        resource_id=application.id,
+        details={
+            "app_id": app_id,
+            "reset_type": "manual",
+            "previous_request_used": req_used,
+            "previous_token_used": tok_used,
+            "previous_cycle_start": cycle_start.isoformat(),
+        },
+    )
+
+    return {
+        "success": True,
+        "message": "配额已重置",
+        "previous_usage": {
+            "request_used": req_used,
+            "token_used": tok_used,
+        },
+    }
+
+
+@app.get("/api/v1/admin/quota/{app_id}/history", response_model=QuotaHistoryResponse)
+async def quota_history(
+    app_id: str,
+    start_time: Optional[str] = Query(None, description="开始时间 (ISO format)"),
+    end_time: Optional[str] = Query(None, description="结束时间 (ISO format)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    user_id: str = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    """应用配额使用历史"""
+    from shared.models.quota import QuotaUsage
+
+    application = db.query(Application).filter(Application.app_id == app_id).first()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="应用不存在")
+
+    query = db.query(QuotaUsage).filter(QuotaUsage.application_id == application.id)
+
+    if start_time:
+        try:
+            st = datetime.fromisoformat(start_time)
+            query = query.filter(QuotaUsage.billing_cycle_start >= st)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无效的 start_time 格式")
+
+    if end_time:
+        try:
+            et = datetime.fromisoformat(end_time)
+            query = query.filter(QuotaUsage.billing_cycle_end <= et)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无效的 end_time 格式")
+
+    total = query.count()
+    records = query.order_by(QuotaUsage.billing_cycle_start.desc()).offset(
+        (page - 1) * page_size
+    ).limit(page_size).all()
+
+    items = [
+        QuotaHistoryItem(
+            id=str(r.id),
+            billing_cycle_start=r.billing_cycle_start.isoformat(),
+            billing_cycle_end=r.billing_cycle_end.isoformat(),
+            request_quota_limit=r.request_quota_limit,
+            request_quota_used=r.request_quota_used,
+            token_quota_limit=r.token_quota_limit,
+            token_quota_used=r.token_quota_used,
+            reset_type=r.reset_type,
+            created_at=r.created_at.isoformat(),
+        )
+        for r in records
+    ]
+
+    return QuotaHistoryResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 if __name__ == "__main__":

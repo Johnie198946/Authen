@@ -80,6 +80,21 @@ export async function submitWizard(
         userId
       );
     }
+
+    // Auto-provision configuration
+    if (data.autoProvision.enabled) {
+      await applicationApi.updateAutoProvision(
+        appId,
+        {
+          is_enabled: true,
+          role_ids: data.autoProvision.roleIds,
+          permission_ids: data.autoProvision.permissionIds,
+          organization_id: data.autoProvision.organizationId,
+          subscription_plan_id: data.autoProvision.subscriptionPlanId,
+        },
+        userId
+      );
+    }
   } catch (err: any) {
     return {
       appId,

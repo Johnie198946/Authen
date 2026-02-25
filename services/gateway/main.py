@@ -36,7 +36,10 @@ from jose import ExpiredSignatureError, JWTError, jwt as jose_jwt
 
 from shared.config import settings
 from shared.database import SessionLocal
-from shared.models.application import Application, AppUser
+from shared.models.application import Application, AppUser, AutoProvisionConfig
+from shared.models.permission import UserRole
+from shared.models.organization import UserOrganization
+from shared.models.subscription import UserSubscription
 from shared.utils.health_check import check_overall_health
 from shared.utils.jwt import create_access_token, create_refresh_token, decode_token
 from services.gateway.cache import get_app_methods, get_app_oauth_config
@@ -51,6 +54,12 @@ from services.gateway.error_handler import (
 from services.gateway.rate_limiter import check_rate_limit
 from services.gateway.router import ServiceRouter, get_service_router
 from services.gateway.scope_checker import check_scope
+from services.gateway.quota_checker import (
+    check_quota,
+    deduct_request_quota,
+    deduct_token_quota,
+    get_quota_usage,
+)
 
 logger = logging.getLogger("gateway")
 
@@ -478,6 +487,139 @@ def _create_app_user_binding(app_data: dict, user_id: str) -> None:
         db.close()
 
 
+def _apply_auto_provision(app_data: dict, user_id: str) -> None:
+    """
+    根据应用的自动配置规则，为新注册用户分配角色、权限、组织和订阅。
+    每一步独立执行，单步失败记录日志但不影响其余步骤。
+    所有操作幂等。
+    """
+    db = _get_db()
+    try:
+        from sqlalchemy import and_
+        import uuid as uuid_mod
+        from datetime import datetime, timedelta
+
+        # 解析 user_id
+        try:
+            user_uuid = uuid_mod.UUID(user_id)
+        except (ValueError, AttributeError):
+            logger.warning("自动配置: 无效的 user_id: %s", user_id)
+            return
+
+        # 查找应用
+        app = db.query(Application).filter(Application.app_id == app_data["app_id"]).first()
+        if not app:
+            return
+
+        # 查询 AutoProvisionConfig
+        config = db.query(AutoProvisionConfig).filter(
+            AutoProvisionConfig.application_id == app.id
+        ).first()
+        if not config or not config.is_enabled:
+            return
+
+        # 1. 幂等角色分配
+        for role_id in (config.role_ids or []):
+            try:
+                role_uuid = uuid_mod.UUID(str(role_id))
+                existing = db.query(UserRole).filter(
+                    and_(
+                        UserRole.user_id == user_uuid,
+                        UserRole.role_id == role_uuid,
+                    )
+                ).first()
+                if not existing:
+                    user_role = UserRole(user_id=user_uuid, role_id=role_uuid)
+                    db.add(user_role)
+                    db.commit()
+            except Exception as e:
+                logger.warning("自动配置: 角色分配失败 (role_id=%s): %s", role_id, str(e))
+                db.rollback()
+
+        # 2. 幂等权限分配 (通过 UserRole 关联到包含对应权限的角色)
+        for permission_id in (config.permission_ids or []):
+            try:
+                perm_uuid = uuid_mod.UUID(str(permission_id))
+                # 查找包含该权限的角色，为用户分配该角色
+                from shared.models.permission import RolePermission
+                role_perm = db.query(RolePermission).filter(
+                    RolePermission.permission_id == perm_uuid
+                ).first()
+                if role_perm:
+                    existing = db.query(UserRole).filter(
+                        and_(
+                            UserRole.user_id == user_uuid,
+                            UserRole.role_id == role_perm.role_id,
+                        )
+                    ).first()
+                    if not existing:
+                        user_role = UserRole(user_id=user_uuid, role_id=role_perm.role_id)
+                        db.add(user_role)
+                        db.commit()
+                else:
+                    logger.warning("自动配置: 未找到包含权限 %s 的角色", permission_id)
+            except Exception as e:
+                logger.warning("自动配置: 权限分配失败 (permission_id=%s): %s", permission_id, str(e))
+                db.rollback()
+
+        # 3. 幂等组织加入
+        if config.organization_id:
+            try:
+                existing = db.query(UserOrganization).filter(
+                    and_(
+                        UserOrganization.user_id == user_uuid,
+                        UserOrganization.organization_id == config.organization_id,
+                    )
+                ).first()
+                if not existing:
+                    user_org = UserOrganization(
+                        user_id=user_uuid,
+                        organization_id=config.organization_id,
+                    )
+                    db.add(user_org)
+                    db.commit()
+            except Exception as e:
+                logger.warning("自动配置: 组织加入失败 (org_id=%s): %s", config.organization_id, str(e))
+                db.rollback()
+
+        # 4. 幂等订阅创建
+        if config.subscription_plan_id:
+            try:
+                existing = db.query(UserSubscription).filter(
+                    and_(
+                        UserSubscription.user_id == user_uuid,
+                        UserSubscription.plan_id == config.subscription_plan_id,
+                        UserSubscription.status == 'active',
+                    )
+                ).first()
+                if not existing:
+                    from shared.models.subscription import SubscriptionPlan
+                    plan = db.query(SubscriptionPlan).filter(
+                        SubscriptionPlan.id == config.subscription_plan_id
+                    ).first()
+                    duration_days = plan.duration_days if plan else 30
+                    now = datetime.utcnow()
+                    user_sub = UserSubscription(
+                        user_id=user_uuid,
+                        plan_id=config.subscription_plan_id,
+                        status='active',
+                        start_date=now,
+                        end_date=now + timedelta(days=duration_days),
+                        auto_renew=True,
+                    )
+                    db.add(user_sub)
+                    db.commit()
+            except Exception as e:
+                logger.warning("自动配置: 订阅创建失败 (plan_id=%s): %s", config.subscription_plan_id, str(e))
+                db.rollback()
+
+    except Exception as e:
+        logger.warning("自动配置执行失败: %s", str(e))
+        db.rollback()
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/gateway/auth/register/email
 # ---------------------------------------------------------------------------
@@ -507,6 +649,7 @@ async def gateway_register_email(request: Request):
     # 注册成功 → 创建 AppUser 绑定
     if status_code < 400 and resp_body.get("user_id"):
         _create_app_user_binding(app_data, resp_body["user_id"])
+        _apply_auto_provision(app_data, resp_body["user_id"])
 
     # 注入 request_id 到成功响应
     if status_code < 400 and request_id:
@@ -552,6 +695,7 @@ async def gateway_register_phone(request: Request):
     # 注册成功 → 创建 AppUser 绑定
     if status_code < 400 and resp_body.get("user_id"):
         _create_app_user_binding(app_data, resp_body["user_id"])
+        _apply_auto_provision(app_data, resp_body["user_id"])
 
     if status_code < 400 and request_id:
         resp_body["request_id"] = request_id
@@ -652,6 +796,7 @@ async def gateway_oauth(provider: str, request: Request):
         # 如果是新用户，创建 AppUser 绑定
         if resp_body.get("is_new_user") and resp_body.get("user", {}).get("id"):
             _create_app_user_binding(app_data, resp_body["user"]["id"])
+            _apply_auto_provision(app_data, resp_body["user"]["id"])
         if request_id:
             resp_body["request_id"] = request_id
 
@@ -1028,6 +1173,114 @@ async def gateway_check_user_permission(user_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/gateway/users/{user_id}/roles  (分配角色)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/gateway/users/{user_id}/roles")
+async def gateway_assign_user_roles(user_id: str, request: Request):
+    """
+    为用户分配角色端点。
+
+    流水线: Bearer Token 鉴权 → role:write Scope 检查 → 限流 → 路由到 Permission Service
+    """
+    bearer_data = await _run_bearer_pipeline(request, f"users/{user_id}/roles/assign", target_user_id=user_id)
+    request_id = getattr(request.state, "request_id", None)
+
+    body = await request.json()
+
+    router = get_service_router()
+    result = await router.forward("permission", "POST", f"/api/v1/users/{user_id}/roles", json=body)
+
+    status_code = result["status_code"]
+    resp_body = result["body"]
+
+    if status_code >= 400:
+        error_code = resp_body.get("error_code", "upstream_error")
+        message = resp_body.get("message", "角色分配失败")
+        response = create_error_response(status_code, error_code, message, request_id)
+        return _inject_rate_limit_headers(response, request)
+
+    if request_id:
+        resp_body["request_id"] = request_id
+
+    response = JSONResponse(status_code=status_code, content=resp_body)
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/v1/gateway/users/{user_id}/roles/{role_id}  (移除角色)
+# ---------------------------------------------------------------------------
+
+@app.delete("/api/v1/gateway/users/{user_id}/roles/{role_id}")
+async def gateway_remove_user_role(user_id: str, role_id: str, request: Request):
+    """
+    移除用户角色端点。
+
+    流水线: Bearer Token 鉴权 → role:write Scope 检查 → 限流 → 路由到 Permission Service
+    """
+    bearer_data = await _run_bearer_pipeline(request, f"users/{user_id}/roles/{role_id}/remove", target_user_id=user_id)
+    request_id = getattr(request.state, "request_id", None)
+
+    router = get_service_router()
+    result = await router.forward("permission", "DELETE", f"/api/v1/users/{user_id}/roles/{role_id}")
+
+    status_code = result["status_code"]
+    resp_body = result["body"]
+
+    if status_code >= 400:
+        error_code = resp_body.get("error_code", "upstream_error")
+        message = resp_body.get("message", "角色移除失败")
+        response = create_error_response(status_code, error_code, message, request_id)
+        return _inject_rate_limit_headers(response, request)
+
+    if request_id:
+        resp_body["request_id"] = request_id
+
+    response = JSONResponse(status_code=status_code, content=resp_body)
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/gateway/users/{user_id}/permissions  (查询用户所有权限)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/gateway/users/{user_id}/permissions")
+async def gateway_get_user_permissions(user_id: str, request: Request):
+    """
+    查询用户所有权限端点。
+
+    流水线: Bearer Token 鉴权 → role:read Scope 检查 → 限流 → 路由到 Permission Service
+    """
+    bearer_data = await _run_bearer_pipeline(request, f"users/{user_id}/permissions", target_user_id=user_id)
+    request_id = getattr(request.state, "request_id", None)
+
+    router = get_service_router()
+    result = await router.forward("permission", "GET", f"/api/v1/users/{user_id}/permissions")
+
+    status_code = result["status_code"]
+    resp_body = result["body"]
+
+    if status_code >= 400:
+        error_code = resp_body.get("error_code", "upstream_error")
+        message = resp_body.get("message", "权限查询失败")
+        response = create_error_response(status_code, error_code, message, request_id)
+        return _inject_rate_limit_headers(response, request)
+
+    if request_id:
+        if isinstance(resp_body, dict):
+            resp_body["request_id"] = request_id
+
+    response = JSONResponse(status_code=status_code, content=resp_body)
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/gateway/auth/change-password
 # ---------------------------------------------------------------------------
 
@@ -1061,6 +1314,130 @@ async def gateway_change_password(request: Request):
         resp_body["request_id"] = request_id
 
     response = JSONResponse(status_code=status_code, content=resp_body)
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/gateway/llm/{path:path}  (大模型 API 代理)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/gateway/llm/{path:path}")
+async def gateway_llm_proxy(path: str, request: Request):
+    """
+    大模型 API 代理端点，含配额检查与扣减。
+
+    流水线: 凭证验证 → Scope 检查 → 限流 → 配额检查 → 扣减请求次数 → 转发下游 → 扣减 Token → 注入配额响应头
+
+    需求: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 4.1, 4.2, 4.3, 4.4, 4.5, 9.3
+    """
+    app_data = await _run_auth_pipeline(request, "", f"llm/{path}")
+    request_id = getattr(request.state, "request_id", None)
+    app_id = app_data["app_id"]
+
+    # 配额检查（在 rate_limit 之后）
+    quota_result = await check_quota(app_id)
+    if not quota_result.allowed:
+        from datetime import datetime, timezone
+        reset_at = datetime.fromtimestamp(quota_result.reset_timestamp, tz=timezone.utc).isoformat()
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "error_code": quota_result.error_code,
+                "message": "Token 配额已耗尽" if quota_result.error_code == "token_quota_exceeded" else "请求次数配额已耗尽" if quota_result.error_code == "request_quota_exceeded" else "应用未配置配额计划",
+                "reset_at": reset_at,
+                "request_id": request_id,
+            },
+        )
+        for k, v in quota_result.headers.items():
+            response.headers[k] = v
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+        return _inject_rate_limit_headers(response, request)
+
+    # 扣减请求次数
+    await deduct_request_quota(app_id)
+
+    # 读取请求体
+    body = await request.body()
+    body_json = None
+    if body:
+        import json as json_mod
+        try:
+            body_json = json_mod.loads(body)
+        except (ValueError, TypeError):
+            body_json = None
+
+    # 转发到下游 LLM 服务
+    router = get_service_router()
+    forward_kwargs = {}
+    if body_json is not None:
+        forward_kwargs["json"] = body_json
+    result = await router.forward("llm", "POST", f"/api/v1/llm/{path}", **forward_kwargs)
+
+    status_code = result["status_code"]
+    resp_body = result["body"]
+
+    # 从下游响应中提取 token_usage
+    token_usage = 0
+    if isinstance(resp_body, dict):
+        token_usage = resp_body.get("token_usage", 0)
+
+    # 扣减 Token 配额并获取更新后的配额状态
+    updated_quota = await deduct_token_quota(app_id, token_usage)
+
+    # 构建响应
+    if status_code >= 400:
+        error_code = resp_body.get("error_code", "upstream_error") if isinstance(resp_body, dict) else "upstream_error"
+        message = resp_body.get("message", "LLM 服务请求失败") if isinstance(resp_body, dict) else "LLM 服务请求失败"
+        response = create_error_response(status_code, error_code, message, request_id)
+    else:
+        if isinstance(resp_body, dict) and request_id:
+            resp_body["request_id"] = request_id
+        response = JSONResponse(status_code=status_code, content=resp_body)
+        if request_id:
+            response.headers["X-Request-Id"] = request_id
+
+    # 注入配额响应头
+    for k, v in updated_quota.headers.items():
+        response.headers[k] = v
+
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/quota/usage  (配额查询)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/quota/usage")
+async def quota_usage(request: Request):
+    """
+    配额查询端点。
+
+    执行与其他 API 相同的认证流程（app_id + Bearer token），从 Redis 读取实时配额数据返回。
+
+    需求: 12.1, 12.2, 12.6
+    """
+    app_data = await _run_auth_pipeline(request, "", "quota/usage")
+    request_id = getattr(request.state, "request_id", None)
+    app_id = app_data["app_id"]
+
+    # 从 Redis 读取实时配额数据
+    usage = await get_quota_usage(app_id)
+
+    # 如果返回了错误码（如 quota_not_configured 或 service_degraded）
+    if "error_code" in usage:
+        status_code = 403 if usage["error_code"] == "quota_not_configured" else 503
+        response = create_error_response(
+            status_code, usage["error_code"], usage["message"], request_id
+        )
+        return _inject_rate_limit_headers(response, request)
+
+    if request_id:
+        usage["request_id"] = request_id
+
+    response = JSONResponse(status_code=200, content=usage)
     if request_id:
         response.headers["X-Request-Id"] = request_id
     return _inject_rate_limit_headers(response, request)

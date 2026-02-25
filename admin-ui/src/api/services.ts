@@ -6,6 +6,30 @@ const ORG_API = 'http://localhost:8005/api/v1';
 const SUB_API = 'http://localhost:8006/api/v1';
 const ADMIN_API = 'http://localhost:8007/api/v1';
 
+// Attach token to all axios requests from this module
+axios.interceptors.request.use((config) => {
+  const token = localStorage.getItem('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Handle 401/403 responses by clearing stale session
+axios.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error.response?.status;
+    if (status === 401 || status === 403) {
+      localStorage.removeItem('access_token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
 // ===== 用户 =====
 export const userApi = {
   list: (page = 1, pageSize = 20, search?: string) =>
@@ -124,4 +148,72 @@ export const applicationApi = {
     axios.get(`${ADMIN_API}/admin/applications/${appId}/subscription-plan`, { params: { user_id: userId } }),
   updateSubscriptionPlan: (appId: string, data: { plan_id: string | null }, userId: string) =>
     axios.put(`${ADMIN_API}/admin/applications/${appId}/subscription-plan`, data, { params: { user_id: userId } }),
+
+  // 自动配置
+  getAutoProvision: (appId: string, userId: string) =>
+    axios.get(`${ADMIN_API}/admin/applications/${appId}/auto-provision`, { params: { user_id: userId } }),
+  updateAutoProvision: (appId: string, data: { role_ids?: string[]; permission_ids?: string[]; organization_id?: string; subscription_plan_id?: string; is_enabled: boolean }, userId: string) =>
+    axios.put(`${ADMIN_API}/admin/applications/${appId}/auto-provision`, data, { params: { user_id: userId } }),
+  deleteAutoProvision: (appId: string, userId: string) =>
+    axios.delete(`${ADMIN_API}/admin/applications/${appId}/auto-provision`, { params: { user_id: userId } }),
+
+  // Webhook 密钥重置
+  resetWebhookSecret: (appId: string) =>
+    axios.post(`${ADMIN_API}/admin/applications/${appId}/reset-webhook-secret`),
+
+  // Webhook 事件日志查询
+  getWebhookEvents: (params: {
+    app_id?: string;
+    event_type?: string;
+    status?: string;
+    start_time?: string;
+    end_time?: string;
+    page?: number;
+    page_size?: number;
+  }) =>
+    axios.get(`${ADMIN_API}/admin/webhook-events`, { params }),
+};
+
+
+// ===== 云服务配置 =====
+export const cloudServiceApi = {
+  list: (serviceType?: string) =>
+    axios.get(`${ADMIN_API}/admin/cloud-services`, { params: { service_type: serviceType } }),
+  create: (data: { service_type: string; provider: string; config: Record<string, any>; is_active?: boolean }, skipValidation = true) =>
+    axios.post(`${ADMIN_API}/admin/cloud-services`, data, { params: { skip_validation: skipValidation } }),
+  update: (configId: string, data: { config?: Record<string, any>; is_active?: boolean }, skipValidation = true) =>
+    axios.put(`${ADMIN_API}/admin/cloud-services/${configId}`, data, { params: { skip_validation: skipValidation } }),
+  delete: (configId: string) =>
+    axios.delete(`${ADMIN_API}/admin/cloud-services/${configId}`),
+  test: (configId: string, data?: Record<string, any>) =>
+    axios.post(`${ADMIN_API}/admin/cloud-services/${configId}/test`, data),
+};
+
+
+// ===== 配额管理 =====
+export const quotaApi = {
+  overview: (sortBy?: string) =>
+    axios.get(`${ADMIN_API}/admin/quota/overview`, { params: { sort_by: sortBy } }),
+  detail: (appId: string) =>
+    axios.get(`${ADMIN_API}/admin/quota/${appId}`),
+  override: (appId: string, data: { request_quota?: number; token_quota?: number }) =>
+    axios.put(`${ADMIN_API}/admin/quota/${appId}/override`, data),
+  reset: (appId: string) =>
+    axios.post(`${ADMIN_API}/admin/quota/${appId}/reset`),
+  history: (appId: string, params?: { start_time?: string; end_time?: string; page?: number; page_size?: number }) =>
+    axios.get(`${ADMIN_API}/admin/quota/${appId}/history`, { params }),
+};
+
+// ===== 消息模板 =====
+export const templateApi = {
+  list: (templateType?: string) =>
+    axios.get(`${ADMIN_API}/admin/templates`, { params: { template_type: templateType } }),
+  get: (id: string) =>
+    axios.get(`${ADMIN_API}/admin/templates/${id}`),
+  create: (data: { name: string; type: string; subject?: string; content: string; variables?: Record<string, string> }) =>
+    axios.post(`${ADMIN_API}/admin/templates`, data),
+  update: (id: string, data: { name?: string; subject?: string; content?: string; variables?: Record<string, string> }) =>
+    axios.put(`${ADMIN_API}/admin/templates/${id}`, data),
+  delete: (id: string) =>
+    axios.delete(`${ADMIN_API}/admin/templates/${id}`),
 };

@@ -281,6 +281,28 @@ class EmailService:
             }
         )
 
+    def send_verification_code_email(self, to_email: str, verification_code: str) -> bool:
+        """
+        发送验证码邮件
+
+        Args:
+            to_email: 收件人邮箱
+            verification_code: 验证码
+
+        Returns:
+            发送是否成功
+        """
+        return self.send_email(
+            to_email=to_email,
+            subject="",
+            body="",
+            template_name="email_verification_code",
+            template_variables={
+                'email': to_email,
+                'verification_code': verification_code
+            }
+        )
+
 
 # 全局邮件服务实例
 email_service = EmailService()

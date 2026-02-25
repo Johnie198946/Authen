@@ -3,6 +3,7 @@ import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { AuthProvider, useAuth } from './store/AuthContext';
 import Login from './pages/Login';
+import Register from './pages/Register';
 import ChangePassword from './pages/ChangePassword';
 import Dashboard from './pages/Dashboard';
 
@@ -16,6 +17,7 @@ function AppRoutes() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
         <Route path="/change-password" element={<ChangePassword />} />
         <Route path="/" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
         <Route path="*" element={<Navigate to="/" />} />

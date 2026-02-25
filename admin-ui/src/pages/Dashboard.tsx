@@ -3,7 +3,8 @@ import { Layout, Menu, Card, Row, Col, Statistic, Button, Typography, message } 
 import {
   UserOutlined, SafetyOutlined, ApartmentOutlined,
   CrownOutlined, AuditOutlined, LogoutOutlined, DashboardOutlined,
-  TeamOutlined, AppstoreOutlined,
+  TeamOutlined, AppstoreOutlined, CloudOutlined,
+  FundOutlined, HistoryOutlined, MailOutlined,
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../store/AuthContext';
@@ -14,6 +15,10 @@ import PermissionsPanel from './panels/PermissionsPanel';
 import OrganizationsPanel from './panels/OrganizationsPanel';
 import SubscriptionsPanel from './panels/SubscriptionsPanel';
 import ApplicationsPanel from './panels/ApplicationsPanel';
+import CloudServicePanel from './panels/CloudServicePanel';
+import QuotaMonitorPanel from './panels/QuotaMonitorPanel';
+import QuotaHistoryPanel from './panels/QuotaHistoryPanel';
+import MessageTemplatePanel from './panels/MessageTemplatePanel';
 
 const { Header, Sider, Content } = Layout;
 const { Title } = Typography;
@@ -73,6 +78,10 @@ export default function Dashboard() {
       case 'subscriptions': return <SubscriptionsPanel />;
       case 'audit': return <AuditPanel />;
       case 'applications': return <ApplicationsPanel />;
+      case 'cloud-services': return <CloudServicePanel />;
+      case 'quota-monitor': return <QuotaMonitorPanel />;
+      case 'quota-history': return <QuotaHistoryPanel />;
+      case 'message-templates': return <MessageTemplatePanel />;
       default: return <OverviewPanel />;
     }
   };
@@ -94,6 +103,10 @@ export default function Dashboard() {
             { key: 'subscriptions', icon: <TeamOutlined />, label: '订阅管理' },
             { key: 'audit', icon: <AuditOutlined />, label: '审计日志' },
             { key: 'applications', icon: <AppstoreOutlined />, label: '应用管理' },
+            { key: 'cloud-services', icon: <CloudOutlined />, label: '云服务配置' },
+            { key: 'quota-monitor', icon: <FundOutlined />, label: '配额监控' },
+            { key: 'quota-history', icon: <HistoryOutlined />, label: '配额历史' },
+            { key: 'message-templates', icon: <MailOutlined />, label: '消息模板' },
           ]} />
       </Sider>
       <Layout>

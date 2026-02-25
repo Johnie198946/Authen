@@ -198,6 +198,15 @@ class TestCreateApplication:
         assert d1["app_id"] != d2["app_id"]
         assert d1["app_secret"] != d2["app_secret"]
 
+    def test_create_generates_webhook_secret(self):
+        """创建应用应自动生成 64 字符 hex 的 webhook_secret"""
+        data = _create_app("WebhookApp")
+        assert "webhook_secret" in data
+        assert data["webhook_secret"] is not None
+        assert len(data["webhook_secret"]) == 64  # 32 bytes = 64 hex chars
+        # Verify it's valid hex
+        int(data["webhook_secret"], 16)
+
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/admin/applications - 应用列表
@@ -249,6 +258,15 @@ class TestGetApplication:
         """不存在的应用应返回 404"""
         resp = client.get("/api/v1/admin/applications/nonexistent?user_id=admin1")
         assert resp.status_code == 404
+
+    def test_get_returns_webhook_secret(self):
+        """应用详情应返回 webhook_secret 字段"""
+        created = _create_app("WebhookDetailApp")
+        resp = client.get(f"/api/v1/admin/applications/{created['app_id']}?user_id=admin1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "webhook_secret" in data
+        assert data["webhook_secret"] == created["webhook_secret"]
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +347,46 @@ class TestResetSecret:
         """重置不存在应用的密钥应返回 404"""
         resp = client.post("/api/v1/admin/applications/nonexistent/reset-secret?user_id=admin1")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/admin/applications/{app_id}/reset-webhook-secret - 重置 Webhook 密钥
+# ---------------------------------------------------------------------------
+
+class TestResetWebhookSecret:
+    def test_reset_webhook_secret_success(self):
+        """重置 webhook_secret 应返回新的密钥"""
+        created = _create_app("WebhookSecretApp")
+        old_webhook_secret = created["webhook_secret"]
+
+        resp = client.post(
+            f"/api/v1/admin/applications/{created['app_id']}/reset-webhook-secret?user_id=admin1"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["app_id"] == created["app_id"]
+        assert len(data["webhook_secret"]) == 64  # 32 bytes = 64 hex chars
+        assert data["webhook_secret"] != old_webhook_secret
+        assert "message" in data
+        # Verify it's valid hex
+        int(data["webhook_secret"], 16)
+
+    def test_reset_webhook_secret_not_found(self):
+        """重置不存在应用的 webhook_secret 应返回 404"""
+        resp = client.post("/api/v1/admin/applications/nonexistent/reset-webhook-secret?user_id=admin1")
+        assert resp.status_code == 404
+
+    def test_reset_webhook_secret_updates_detail(self):
+        """重置后应用详情应返回新的 webhook_secret"""
+        created = _create_app("WebhookUpdateApp")
+
+        resp = client.post(
+            f"/api/v1/admin/applications/{created['app_id']}/reset-webhook-secret?user_id=admin1"
+        )
+        new_secret = resp.json()["webhook_secret"]
+
+        detail = client.get(f"/api/v1/admin/applications/{created['app_id']}?user_id=admin1")
+        assert detail.json()["webhook_secret"] == new_secret
 
 
 # ---------------------------------------------------------------------------

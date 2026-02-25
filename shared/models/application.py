@@ -3,10 +3,24 @@
 """
 from datetime import datetime
 from sqlalchemy import Column, String, Integer, DateTime, Boolean, ForeignKey, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.types import TypeDecorator, JSON
 from sqlalchemy.orm import relationship
 import uuid
 from shared.database import Base
+
+
+# 创建一个兼容SQLite的JSONB类型
+class JSONBCompat(TypeDecorator):
+    """兼容SQLite的JSONB类型"""
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == 'postgresql':
+            return dialect.type_descriptor(JSONB())
+        else:
+            return dialect.type_descriptor(JSON())
 
 
 class Application(Base):
@@ -20,6 +34,8 @@ class Application(Base):
     app_secret_hash = Column(String(255), nullable=False)
     status = Column(String(20), default='active', nullable=False, index=True)  # active / disabled
     rate_limit = Column(Integer, default=60, nullable=False)
+    webhook_secret = Column(String(255), nullable=True)  # Webhook 签名密钥
+    webhook_url = Column(String(1024), nullable=True)  # Webhook 回调地址
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -29,6 +45,7 @@ class Application(Base):
     app_users = relationship("AppUser", back_populates="application", cascade="all, delete-orphan")
     app_organizations = relationship("AppOrganization", back_populates="application", cascade="all, delete-orphan")
     app_subscription_plan = relationship("AppSubscriptionPlan", back_populates="application", cascade="all, delete-orphan", uselist=False)
+    auto_provision_config = relationship("AutoProvisionConfig", back_populates="application", cascade="all, delete-orphan", uselist=False)
 
 
 class AppLoginMethod(Base):
@@ -116,3 +133,32 @@ class AppSubscriptionPlan(Base):
     __table_args__ = (
         UniqueConstraint('application_id', name='uq_app_subscription_plan'),
     )
+
+
+class AutoProvisionConfig(Base):
+    """应用用户自动配置规则表"""
+    __tablename__ = "auto_provision_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    application_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey('applications.id', ondelete='CASCADE'),
+        nullable=False, unique=True, index=True
+    )
+    role_ids = Column(JSONBCompat, default=list)
+    permission_ids = Column(JSONBCompat, default=list)
+    organization_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey('organizations.id', ondelete='SET NULL'),
+        nullable=True
+    )
+    subscription_plan_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey('subscription_plans.id', ondelete='SET NULL'),
+        nullable=True
+    )
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    application = relationship("Application", back_populates="auto_provision_config")

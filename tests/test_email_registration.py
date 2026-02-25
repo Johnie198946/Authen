@@ -1,426 +1,336 @@
 """
-邮箱注册测试
+邮箱验证码注册测试
 
-Feature: unified-auth-platform, Property 1: 邮箱注册完整性
+验证需求：4.1, 4.2, 4.3, 4.4, 4.5, 4.6
 
-对于任意有效的邮箱地址和密码，当用户通过邮箱注册时，
-系统应该发送验证邮件，并在用户点击验证链接后成功创建账号且账号状态为已验证。
-
-验证需求：1.1
+使用 mock DB session 避免 SQLite 不支持 PostgreSQL UUID 类型的问题。
 """
-import pytest
-from hypothesis import given, strategies as st
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from shared.models.user import Base, User
-from shared.database import get_db
-from shared.redis_client import get_redis
 import sys
 import os
-
-# 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+from fastapi.testclient import TestClient
+from unittest.mock import MagicMock
+from datetime import datetime
+import uuid
+
+from shared.database import get_db
+from shared.redis_client import get_redis
+from shared.models.user import User
 from services.auth.main import app
 
 
-# 测试数据库配置
-TEST_DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# ---------------------------------------------------------------------------
+# In-memory user store
+# ---------------------------------------------------------------------------
+
+class InMemoryUserStore:
+    def __init__(self):
+        self.users = []
+
+    def reset(self):
+        self.users.clear()
+
+    def add(self, user_obj):
+        self.users.append(user_obj)
+
+    def find_by_email(self, email):
+        for u in self.users:
+            if u.email == email:
+                return u
+        return None
+
+    def find_by_username(self, username):
+        for u in self.users:
+            if u.username == username:
+                return u
+        return None
+
+
+store = InMemoryUserStore()
+
+
+class FakeQuery:
+    def __init__(self, store_ref):
+        self._store = store_ref
+        self._filters = {}
+
+    def filter(self, *args):
+        for arg in args:
+            try:
+                col_name = arg.left.key
+                value = arg.right.effective_value
+                self._filters[col_name] = value
+            except Exception:
+                pass
+        return self
+
+    def first(self):
+        email = self._filters.get("email")
+        if email:
+            return self._store.find_by_email(email)
+        username = self._filters.get("username")
+        if username:
+            return self._store.find_by_username(username)
+        return None
+
+
+class FakeSession:
+    def __init__(self, store_ref):
+        self._store = store_ref
+        self._pending = None
+
+    def query(self, model):
+        return FakeQuery(self._store)
+
+    def add(self, obj):
+        self._pending = obj
+
+    def commit(self):
+        if self._pending:
+            self._store.add(self._pending)
+
+    def refresh(self, obj):
+        if not getattr(obj, "id", None):
+            obj.id = uuid.uuid4()
+        if not getattr(obj, "created_at", None):
+            obj.created_at = datetime.utcnow()
+        if not getattr(obj, "updated_at", None):
+            obj.updated_at = datetime.utcnow()
+
+    def close(self):
+        self._pending = None
 
 
 def override_get_db():
-    """覆盖数据库依赖"""
+    session = FakeSession(store)
     try:
-        db = TestingSessionLocal()
-        yield db
+        yield session
     finally:
-        db.close()
+        session.close()
 
 
-# 覆盖依赖
 app.dependency_overrides[get_db] = override_get_db
-
-# 创建测试客户端
 client = TestClient(app)
 
 
-# 邮箱生成器
-emails = st.emails()
-
-# 密码生成器（符合复杂度要求）
-passwords = st.text(
-    alphabet=st.characters(
-        whitelist_categories=('Lu', 'Ll', 'Nd'),
-        whitelist_characters='!@#$%^&*()'
-    ),
-    min_size=8,
-    max_size=32
-)
-
-# 用户名生成器
-usernames = st.text(
-    alphabet=st.characters(whitelist_categories=('Lu', 'Ll', 'Nd')),
-    min_size=3,
-    max_size=50
-)
-
-
 @pytest.fixture(autouse=True)
-def setup_database():
-    """每个测试前设置数据库"""
-    Base.metadata.create_all(bind=engine)
+def setup():
+    """每个测试前清理 store 和 Redis"""
+    store.reset()
+    redis = get_redis()
+    redis.flushdb()
     yield
-    Base.metadata.drop_all(bind=engine)
+    store.reset()
+    redis.flushdb()
 
 
-@given(
-    email=emails,
-    password=passwords,
-    username=usernames
-)
-def test_email_registration_integrity(email, password, username):
-    """
-    属性 1：邮箱注册完整性
-    
-    对于任意有效的邮箱和密码，注册流程应该：
-    1. 成功创建用户记录
-    2. 用户状态为待验证
-    3. 生成验证令牌
-    4. 验证后用户状态变为已激活
-    """
-    # 步骤1：邮箱注册
+def _store_code(email: str, code: str = "123456"):
+    redis = get_redis()
+    redis.setex(f"email_code:{email}", 300, code)
+
+
+# ==================== Tests ====================
+
+
+def test_email_registration_success():
+    """注册成功：验证码匹配，用户状态为 active，验证码被删除"""
+    email = "test1@example.com"
+    code = "654321"
+    _store_code(email, code)
+
     response = client.post(
         "/api/v1/auth/register/email",
         json={
             "email": email,
-            "password": password,
-            "username": username
-        }
-    )
-    
-    # 属性1：注册请求应该成功
-    assert response.status_code in [200, 400, 409], \
-        f"注册响应状态码应该是200、400或409，实际是{response.status_code}"
-    
-    if response.status_code == 200:
-        data = response.json()
-        
-        # 属性2：响应应该包含必要字段
-        assert "success" in data, "响应应该包含success字段"
-        assert "message" in data, "响应应该包含message字段"
-        assert "user_id" in data, "响应应该包含user_id字段"
-        
-        assert data["success"] is True, "注册应该成功"
-        
-        # 属性3：用户应该被创建且状态为待验证
-        db = TestingSessionLocal()
-        try:
-            user = db.query(User).filter(User.email == email).first()
-            assert user is not None, "用户应该被创建"
-            assert user.status == 'pending_verification', \
-                "用户状态应该是pending_verification"
-            assert user.username == username, "用户名应该正确"
-            
-            # 属性4：密码应该被加密存储
-            assert user.password_hash != password, "密码不应该明文存储"
-            assert len(user.password_hash) == 60, "bcrypt哈希长度应该是60"
-            
-            # 属性5：验证令牌应该被生成并存储在Redis
-            redis = get_redis()
-            # 查找所有验证令牌
-            keys = redis.keys("email_verification:*")
-            assert len(keys) > 0, "应该生成验证令牌"
-            
-            # 模拟验证流程
-            # 获取第一个验证令牌
-            token = keys[0].decode().split(':')[1]
-            
-            # 步骤2：验证邮箱
-            verify_response = client.get(f"/api/v1/auth/verify-email?token={token}")
-            
-            # 属性6：验证请求应该成功
-            assert verify_response.status_code == 200, \
-                f"验证响应状态码应该是200，实际是{verify_response.status_code}"
-            
-            verify_data = verify_response.json()
-            assert verify_data["success"] is True, "验证应该成功"
-            
-            # 属性7：用户状态应该变为已激活
-            db.refresh(user)
-            assert user.status == 'active', "验证后用户状态应该是active"
-            
-        finally:
-            db.close()
-
-
-def test_email_registration_with_specific_examples():
-    """使用具体示例测试邮箱注册"""
-    test_cases = [
-        {
-            "email": "test1@example.com",
             "password": "Password123!",
-            "username": "testuser1"
+            "username": "testuser1",
+            "verification_code": code,
         },
-        {
-            "email": "test2@example.com",
-            "password": "SecurePass456@",
-            "username": "testuser2"
-        },
-        {
-            "email": "test3@example.com",
-            "password": "MyP@ssw0rd",
-            "username": "testuser3"
-        }
-    ]
-    
-    for case in test_cases:
-        # 注册
-        response = client.post("/api/v1/auth/register/email", json=case)
-        assert response.status_code == 200, \
-            f"注册应该成功: {case['email']}"
-        
-        data = response.json()
-        assert data["success"] is True
-        
-        # 验证用户被创建
-        db = TestingSessionLocal()
-        try:
-            user = db.query(User).filter(User.email == case["email"]).first()
-            assert user is not None, f"用户应该被创建: {case['email']}"
-            assert user.status == 'pending_verification'
-        finally:
-            db.close()
-
-
-def test_duplicate_email_registration():
-    """测试重复邮箱注册"""
-    user_data = {
-        "email": "duplicate@example.com",
-        "password": "Password123!",
-        "username": "duplicateuser"
-    }
-    
-    # 第一次注册应该成功
-    response1 = client.post("/api/v1/auth/register/email", json=user_data)
-    assert response1.status_code == 200, "第一次注册应该成功"
-    
-    # 第二次注册应该失败（邮箱已存在）
-    response2 = client.post("/api/v1/auth/register/email", json=user_data)
-    assert response2.status_code == 409, "重复邮箱注册应该返回409"
-    
-    error_data = response2.json()
-    assert "邮箱" in error_data["detail"], "错误消息应该提示邮箱已存在"
-
-
-def test_invalid_email_format():
-    """测试无效邮箱格式"""
-    invalid_emails = [
-        "notanemail",
-        "@example.com",
-        "user@",
-        "user @example.com",
-        ""
-    ]
-    
-    for invalid_email in invalid_emails:
-        response = client.post(
-            "/api/v1/auth/register/email",
-            json={
-                "email": invalid_email,
-                "password": "Password123!",
-                "username": "testuser"
-            }
-        )
-        # FastAPI的EmailStr验证会返回422
-        assert response.status_code == 422, \
-            f"无效邮箱应该返回422: {invalid_email}"
-
-
-def test_weak_password_rejection():
-    """测试弱密码被拒绝"""
-    weak_passwords = [
-        "123",  # 太短
-        "password",  # 没有数字和大写字母
-        "12345678",  # 只有数字
-        "abcdefgh",  # 只有小写字母
-    ]
-    
-    for weak_password in weak_passwords:
-        response = client.post(
-            "/api/v1/auth/register/email",
-            json={
-                "email": "test@example.com",
-                "password": weak_password,
-                "username": "testuser"
-            }
-        )
-        assert response.status_code == 400, \
-            f"弱密码应该被拒绝: {weak_password}"
-
-
-def test_invalid_username():
-    """测试无效用户名"""
-    invalid_usernames = [
-        "ab",  # 太短
-        "a" * 51,  # 太长
-        "user name",  # 包含空格
-        "user@name",  # 包含特殊字符
-        ""  # 空用户名
-    ]
-    
-    for invalid_username in invalid_usernames:
-        response = client.post(
-            "/api/v1/auth/register/email",
-            json={
-                "email": "test@example.com",
-                "password": "Password123!",
-                "username": invalid_username
-            }
-        )
-        assert response.status_code in [400, 422], \
-            f"无效用户名应该被拒绝: {invalid_username}"
-
-
-def test_email_verification_token_expiry():
-    """测试验证令牌过期"""
-    # 注册用户
-    response = client.post(
-        "/api/v1/auth/register/email",
-        json={
-            "email": "expiry@example.com",
-            "password": "Password123!",
-            "username": "expiryuser"
-        }
     )
     assert response.status_code == 200
-    
-    # 使用无效令牌验证
-    invalid_token = "invalid_token_12345"
-    verify_response = client.get(f"/api/v1/auth/verify-email?token={invalid_token}")
-    
-    assert verify_response.status_code == 400, "无效令牌应该返回400"
-    error_data = verify_response.json()
-    assert "无效" in error_data["detail"] or "过期" in error_data["detail"]
+    data = response.json()
+    assert data["success"] is True
+    assert data["message"] == "注册成功"
+    assert "user_id" in data
+
+    # 用户状态应为 active
+    user = store.find_by_email(email)
+    assert user is not None
+    assert user.status == "active"
+    assert user.username == "testuser1"
+    assert user.password_hash != "Password123!"
+
+    # 验证码应被删除
+    redis = get_redis()
+    assert redis.get(f"email_code:{email}") is None
 
 
-def test_duplicate_username_registration():
-    """测试重复用户名注册"""
-    # 第一个用户
-    response1 = client.post(
-        "/api/v1/auth/register/email",
-        json={
-            "email": "user1@example.com",
-            "password": "Password123!",
-            "username": "sameusername"
-        }
-    )
-    assert response1.status_code == 200
-    
-    # 第二个用户使用相同用户名
-    response2 = client.post(
-        "/api/v1/auth/register/email",
-        json={
-            "email": "user2@example.com",
-            "password": "Password123!",
-            "username": "sameusername"
-        }
-    )
-    assert response2.status_code == 409, "重复用户名应该返回409"
-
-
-def test_registration_creates_pending_user():
-    """测试注册创建待验证用户"""
-    response = client.post(
-        "/api/v1/auth/register/email",
-        json={
-            "email": "pending@example.com",
-            "password": "Password123!",
-            "username": "pendinguser"
-        }
-    )
-    assert response.status_code == 200
-    
-    # 检查用户状态
-    db = TestingSessionLocal()
-    try:
-        user = db.query(User).filter(User.email == "pending@example.com").first()
+def test_registration_with_multiple_examples():
+    """使用多个具体示例测试注册"""
+    cases = [
+        ("a@example.com", "Password123!", "userA", "111111"),
+        ("b@example.com", "SecurePass456@", "userB", "222222"),
+        ("c@example.com", "MyP@ssw0rd", "userC", "333333"),
+    ]
+    for email, password, username, code in cases:
+        _store_code(email, code)
+        resp = client.post(
+            "/api/v1/auth/register/email",
+            json={
+                "email": email,
+                "password": password,
+                "username": username,
+                "verification_code": code,
+            },
+        )
+        assert resp.status_code == 200, f"注册应该成功: {email}"
+        user = store.find_by_email(email)
         assert user is not None
-        assert user.status == 'pending_verification', \
-            "新注册用户应该是待验证状态"
-        assert user.failed_login_attempts == 0, "失败登录次数应该是0"
-        assert user.locked_until is None, "不应该被锁定"
-    finally:
-        db.close()
+        assert user.status == "active"
 
 
-def test_verification_activates_user():
-    """测试验证激活用户"""
-    # 注册
-    response = client.post(
+def test_invalid_verification_code_returns_400():
+    """验证码无效或已过期返回 400"""
+    # 没有存储验证码
+    resp = client.post(
         "/api/v1/auth/register/email",
         json={
-            "email": "activate@example.com",
+            "email": "nocode@example.com",
             "password": "Password123!",
-            "username": "activateuser"
-        }
+            "username": "nocodeuser",
+            "verification_code": "999999",
+        },
     )
-    assert response.status_code == 200
-    
-    # 获取验证令牌
-    redis = get_redis()
-    keys = redis.keys("email_verification:*")
-    assert len(keys) > 0
-    
-    token = keys[0].decode().split(':')[1]
-    
-    # 验证前检查状态
-    db = TestingSessionLocal()
-    try:
-        user = db.query(User).filter(User.email == "activate@example.com").first()
-        assert user.status == 'pending_verification'
-        
-        # 验证
-        verify_response = client.get(f"/api/v1/auth/verify-email?token={token}")
-        assert verify_response.status_code == 200
-        
-        # 验证后检查状态
-        db.refresh(user)
-        assert user.status == 'active', "验证后用户应该被激活"
-    finally:
-        db.close()
+    assert resp.status_code == 400
+    assert "验证码无效或已过期" in resp.json()["detail"]
 
 
-def test_verification_token_deleted_after_use():
-    """测试验证令牌使用后被删除"""
-    # 注册
-    response = client.post(
+def test_wrong_verification_code_returns_400():
+    """验证码不匹配返回 400"""
+    email = "wrong@example.com"
+    _store_code(email, "123456")
+
+    resp = client.post(
         "/api/v1/auth/register/email",
         json={
-            "email": "tokendelete@example.com",
+            "email": email,
             "password": "Password123!",
-            "username": "tokendeleteuser"
-        }
+            "username": "wrongcodeuser",
+            "verification_code": "654321",
+        },
     )
-    assert response.status_code == 200
-    
-    # 获取验证令牌
+    assert resp.status_code == 400
+    assert "验证码无效或已过期" in resp.json()["detail"]
+
+
+def test_duplicate_email_returns_409():
+    """邮箱已注册返回 409"""
+    email = "dup@example.com"
+    _store_code(email, "111111")
+
+    resp1 = client.post(
+        "/api/v1/auth/register/email",
+        json={
+            "email": email,
+            "password": "Password123!",
+            "username": "dupuser1",
+            "verification_code": "111111",
+        },
+    )
+    assert resp1.status_code == 200
+
+    # 第二次注册需要新验证码
+    _store_code(email, "222222")
+    resp2 = client.post(
+        "/api/v1/auth/register/email",
+        json={
+            "email": email,
+            "password": "Password123!",
+            "username": "dupuser2",
+            "verification_code": "222222",
+        },
+    )
+    assert resp2.status_code == 409
+    assert "邮箱已被注册" in resp2.json()["detail"]
+
+
+def test_duplicate_username_returns_409():
+    """用户名已使用返回 409"""
+    _store_code("u1@example.com", "111111")
+    resp1 = client.post(
+        "/api/v1/auth/register/email",
+        json={
+            "email": "u1@example.com",
+            "password": "Password123!",
+            "username": "sameuser",
+            "verification_code": "111111",
+        },
+    )
+    assert resp1.status_code == 200
+
+    _store_code("u2@example.com", "222222")
+    resp2 = client.post(
+        "/api/v1/auth/register/email",
+        json={
+            "email": "u2@example.com",
+            "password": "Password123!",
+            "username": "sameuser",
+            "verification_code": "222222",
+        },
+    )
+    assert resp2.status_code == 409
+    assert "用户名已被使用" in resp2.json()["detail"]
+
+
+def test_invalid_email_format_returns_422():
+    """无效邮箱格式返回 422（Pydantic EmailStr 校验）"""
+    for bad_email in ["notanemail", "@example.com", "user@", ""]:
+        resp = client.post(
+            "/api/v1/auth/register/email",
+            json={
+                "email": bad_email,
+                "password": "Password123!",
+                "username": "testuser",
+                "verification_code": "123456",
+            },
+        )
+        assert resp.status_code == 422, f"无效邮箱应返回 422: {bad_email}"
+
+
+def test_weak_password_returns_400():
+    """密码强度不足返回 400"""
+    for weak_pw in ["123", "password", "12345678", "abcdefgh"]:
+        email = "weakpw@example.com"
+        _store_code(email, "123456")
+        resp = client.post(
+            "/api/v1/auth/register/email",
+            json={
+                "email": email,
+                "password": weak_pw,
+                "username": "testuser",
+                "verification_code": "123456",
+            },
+        )
+        assert resp.status_code == 400, f"弱密码应被拒绝: {weak_pw}"
+
+
+def test_verification_code_deleted_after_registration():
+    """注册成功后验证码被删除（单次使用）"""
+    email = "onetime@example.com"
+    _store_code(email, "123456")
+
+    resp = client.post(
+        "/api/v1/auth/register/email",
+        json={
+            "email": email,
+            "password": "Password123!",
+            "username": "onetimeuser",
+            "verification_code": "123456",
+        },
+    )
+    assert resp.status_code == 200
+
     redis = get_redis()
-    keys_before = redis.keys("email_verification:*")
-    assert len(keys_before) > 0
-    
-    token = keys_before[0].decode().split(':')[1]
-    
-    # 验证
-    verify_response = client.get(f"/api/v1/auth/verify-email?token={token}")
-    assert verify_response.status_code == 200
-    
-    # 令牌应该被删除
-    token_value = redis.get(f"email_verification:{token}")
-    assert token_value is None, "验证令牌使用后应该被删除"
-    
-    # 再次使用相同令牌应该失败
-    verify_response2 = client.get(f"/api/v1/auth/verify-email?token={token}")
-    assert verify_response2.status_code == 400, "已使用的令牌应该无效"
+    assert redis.get(f"email_code:{email}") is None

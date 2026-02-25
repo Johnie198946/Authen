@@ -52,6 +52,7 @@ class EmailRegisterRequest(BaseModel):
     email: EmailStr
     password: str
     username: str
+    verification_code: str
 
 
 class EmailRegisterResponse(BaseModel):
@@ -141,6 +142,54 @@ class FirstLoginCheckResponse(BaseModel):
     message: str
 
 
+class SendEmailCodeRequest(BaseModel):
+    """发送邮箱验证码请求"""
+    email: str
+
+
+class PhoneCodeLoginRequest(BaseModel):
+    """手机验证码登录请求"""
+    phone: str
+    code: str
+
+
+class EmailCodeLoginRequest(BaseModel):
+    """邮箱验证码登录请求"""
+    email: str
+    code: str
+
+
+# ==================== 验证码辅助函数 ====================
+
+def generate_verification_code() -> str:
+    """生成 6 位数字验证码"""
+    return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
+
+
+def check_rate_limit(redis_client, code_type: str, target: str) -> bool:
+    """检查验证码发送频率限制，返回 True 表示被限制"""
+    return redis_client.exists(f"code_rate:{code_type}:{target}")
+
+
+def set_rate_limit(redis_client, code_type: str, target: str):
+    """设置频率限制标记，60 秒 TTL"""
+    redis_client.setex(f"code_rate:{code_type}:{target}", 60, "1")
+
+
+def store_verification_code(redis_client, key: str, code: str, ttl: int = 300):
+    """存储验证码到 Redis"""
+    redis_client.setex(key, ttl, code)
+
+
+def verify_and_delete_code(redis_client, key: str, submitted_code: str) -> bool:
+    """验证并删除验证码，返回是否匹配"""
+    stored = redis_client.get(key)
+    if not stored or stored != submitted_code:
+        return False
+    redis_client.delete(key)
+    return True
+
+
 # ==================== API端点 ====================
 
 @app.get("/")
@@ -212,26 +261,18 @@ async def register_with_email(
     db: Session = Depends(get_db)
 ):
     """
-    邮箱注册
-    
-    需求：1.1 - 用户选择邮箱注册时，发送验证邮件并在验证后创建账号
+    邮箱验证码注册
+
+    需求：4.1–4.6 - 使用邮箱验证码完成注册，验证通过后直接激活账号
     """
-    # 验证用户名
-    is_valid, error_msg = validate_username(request.username)
-    if not is_valid:
+    # 验证验证码
+    redis = get_redis()
+    if not verify_and_delete_code(redis, f"email_code:{request.email}", request.verification_code):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg
+            detail="验证码无效或已过期"
         )
-    
-    # 验证密码强度
-    is_valid, error_msg = validate_password(request.password)
-    if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg
-        )
-    
+
     # 检查邮箱是否已存在
     existing_user = db.query(User).filter(User.email == request.email).first()
     if existing_user:
@@ -239,7 +280,7 @@ async def register_with_email(
             status_code=status.HTTP_409_CONFLICT,
             detail="邮箱已被注册"
         )
-    
+
     # 检查用户名是否已存在
     existing_user = db.query(User).filter(User.username == request.username).first()
     if existing_user:
@@ -247,35 +288,39 @@ async def register_with_email(
             status_code=status.HTTP_409_CONFLICT,
             detail="用户名已被使用"
         )
-    
-    # 创建用户（状态为未验证）
+
+    # 验证用户名
+    is_valid, error_msg = validate_username(request.username)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_msg
+        )
+
+    # 验证密码强度
+    is_valid, error_msg = validate_password(request.password)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_msg
+        )
+
+    # 创建用户（验证码已验证，直接激活）
     hashed_password = hash_password(request.password)
     new_user = User(
         username=request.username,
         email=request.email,
         password_hash=hashed_password,
-        status='pending_verification'  # 待验证状态
+        status='active'
     )
-    
+
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    
-    # 生成验证令牌
-    verification_token = secrets.token_urlsafe(32)
-    redis = get_redis()
-    redis.setex(
-        f"email_verification:{verification_token}",
-        3600,  # 1小时过期
-        str(new_user.id)
-    )
-    
-    # TODO: 发送验证邮件（调用通知服务）
-    # 这里暂时返回成功，实际应该发送邮件
-    
+
     return EmailRegisterResponse(
         success=True,
-        message="验证邮件已发送，请查收",
+        message="注册成功",
         user_id=str(new_user.id)
     )
 
@@ -581,16 +626,28 @@ async def send_sms_code(request: SendSMSRequest):
             detail="手机号格式不正确"
         )
     
+    # 获取 Redis 客户端
+    redis = get_redis()
+    
+    # 检查频率限制
+    if check_rate_limit(redis, "sms", request.phone):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="发送过于频繁，请60秒后重试"
+        )
+    
     # 生成6位验证码
     verification_code = ''.join([str(secrets.randbelow(10)) for _ in range(6)])
     
     # 存储到Redis，5分钟过期
-    redis = get_redis()
     redis.setex(
         f"sms_code:{request.phone}",
         300,  # 5分钟
         verification_code
     )
+    
+    # 设置频率限制
+    set_rate_limit(redis, "sms", request.phone)
     
     # TODO: 调用通知服务发送短信
     # 开发环境下直接返回验证码（生产环境应该删除）
@@ -599,6 +656,215 @@ async def send_sms_code(request: SendSMSRequest):
         "message": "验证码已发送",
         "code": verification_code if settings.DEBUG else None
     }
+
+
+@app.post("/api/v1/auth/send-email-code")
+async def send_email_code(request: SendEmailCodeRequest):
+    """
+    发送邮箱验证码
+
+    需求：1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 7.1, 7.2, 7.3
+    """
+    from shared.utils.validators import validate_email
+    from services.notification.email_service import EmailService
+
+    # 校验邮箱格式
+    if not validate_email(request.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="邮箱格式不正确"
+        )
+
+    redis = get_redis()
+
+    # 检查频率限制
+    if check_rate_limit(redis, "email", request.email):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="发送过于频繁，请60秒后重试"
+        )
+
+    # 生成 6 位验证码并存储到 Redis
+    code = generate_verification_code()
+    store_verification_code(redis, f"email_code:{request.email}", code, ttl=300)
+
+    # 设置频率限制
+    set_rate_limit(redis, "email", request.email)
+
+    # 调用 EmailService 发送验证码邮件
+    email_svc = EmailService()
+    send_ok = email_svc.send_verification_code_email(request.email, code)
+    if not send_ok:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="邮件发送失败，请稍后重试"
+        )
+
+    return {
+        "success": True,
+        "message": "验证码已发送",
+        "code": code if settings.DEBUG else None
+    }
+
+
+@app.post("/api/v1/auth/login/phone-code", response_model=LoginResponse)
+async def login_with_phone_code(
+    request: PhoneCodeLoginRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    手机验证码登录
+
+    需求：2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7
+    """
+    redis = get_redis()
+
+    # 验证验证码
+    if not verify_and_delete_code(redis, f"sms_code:{request.phone}", request.code):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="验证码无效或已过期"
+        )
+
+    # 查找用户
+    user = db.query(User).filter(User.phone == request.phone).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在"
+        )
+
+    # 检查账号锁定
+    if user.status == 'locked' or (user.locked_until and user.locked_until > datetime.utcnow()):
+        if user.locked_until and user.locked_until > datetime.utcnow():
+            remaining_time = (user.locked_until - datetime.utcnow()).seconds // 60
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"账号已被锁定，请在{remaining_time}分钟后重试"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号已被锁定"
+        )
+
+    # 检查账号未激活
+    if user.status == 'pending_verification':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号未激活"
+        )
+
+    # 登录成功：重置失败次数、更新最后登录时间
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+
+    # 创建SSO全局会话
+    sso_session = create_sso_session(str(user.id), db)
+
+    # 生成Token
+    token_data = {
+        "sub": str(user.id),
+        "username": user.username,
+        "email": user.email
+    }
+
+    access_token = create_access_token(token_data)
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        sso_session_token=sso_session.session_token,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user={
+            "id": str(user.id),
+            "username": user.username,
+            "email": user.email,
+            "requires_password_change": not user.password_changed
+        }
+    )
+
+@app.post("/api/v1/auth/login/email-code", response_model=LoginResponse)
+async def login_with_email_code(
+    request: EmailCodeLoginRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    邮箱验证码登录
+
+    需求：3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7
+    """
+    redis = get_redis()
+
+    # 验证验证码
+    if not verify_and_delete_code(redis, f"email_code:{request.email}", request.code):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="验证码无效或已过期"
+        )
+
+    # 查找用户
+    user = db.query(User).filter(User.email == request.email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在"
+        )
+
+    # 检查账号锁定
+    if user.status == 'locked' or (user.locked_until and user.locked_until > datetime.utcnow()):
+        if user.locked_until and user.locked_until > datetime.utcnow():
+            remaining_time = (user.locked_until - datetime.utcnow()).seconds // 60
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"账号已被锁定，请在{remaining_time}分钟后重试"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号已被锁定"
+        )
+
+    # 检查账号未激活
+    if user.status == 'pending_verification':
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号未激活"
+        )
+
+    # 登录成功：重置失败次数、更新最后登录时间
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+
+    # 创建SSO全局会话
+    sso_session = create_sso_session(str(user.id), db)
+
+    # 生成Token
+    token_data = {
+        "sub": str(user.id),
+        "username": user.username,
+        "email": user.email
+    }
+
+    access_token = create_access_token(token_data)
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        sso_session_token=sso_session.session_token,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user={
+            "id": str(user.id),
+            "username": user.username,
+            "email": user.email,
+            "requires_password_change": not user.password_changed
+        }
+    )
+
 
 
 @app.post("/api/v1/auth/register/phone", response_model=PhoneRegisterResponse)

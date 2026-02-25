@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import Column, String, Integer, DateTime, Boolean, ForeignKey, Text, Numeric
+from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Boolean, ForeignKey, Text, Numeric
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.types import TypeDecorator, JSON
 from sqlalchemy.orm import relationship
@@ -35,6 +35,9 @@ class SubscriptionPlan(Base):
     price = Column(Numeric(10, 2), nullable=False)
     features = Column(JSONBCompat, nullable=True)  # 订阅包含的功能特性
     is_active = Column(Boolean, default=True, nullable=False)
+    request_quota = Column(Integer, default=-1, nullable=False)       # 每周期最大请求次数，-1 表示无限制
+    token_quota = Column(BigInteger, default=-1, nullable=False)      # 每周期最大 Token 消耗量，-1 表示无限制
+    quota_period_days = Column(Integer, default=30, nullable=False)   # 配额重置周期（天）
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     

@@ -43,4 +43,16 @@ export const authApi = {
     client.post('/auth/refresh', { refresh_token }),
   changePassword: (userId: string, old_password: string, new_password: string) =>
     client.post(`/auth/change-password?user_id=${userId}`, { old_password, new_password }),
+  sendEmailCode: (email: string) =>
+    client.post('/auth/send-email-code', { email }),
+  sendSmsCode: (phone: string) =>
+    client.post('/auth/send-sms', { phone }),
+  loginWithPhoneCode: (phone: string, code: string) =>
+    client.post('/auth/login/phone-code', { phone, code }),
+  loginWithEmailCode: (email: string, code: string) =>
+    client.post('/auth/login/email-code', { email, code }),
+  registerWithEmailCode: (email: string, username: string, password: string, code: string) =>
+    client.post('/auth/register/email', { email, username, password, verification_code: code }),
+  registerWithPhoneCode: (phone: string, username: string, password: string, code: string) =>
+    client.post('/auth/register/phone', { phone, username, password, verification_code: code }),
 };
