@@ -47,7 +47,7 @@ def is_super_admin(user_id: str, db: Session) -> bool:
     cached = redis.get(cache_key)
     
     if cached is not None:
-        return cached.decode('utf-8') == 'true'
+        return str(cached) == 'true'
     
     # 缓存未命中，从数据库查询
     # 查询用户是否拥有super_admin角色
@@ -588,10 +588,13 @@ async def get_user_permissions(user_id: str, db: Session = Depends(get_db)):
     return {"permissions": permissions}
 
 
+class CheckPermissionRequest(BaseModel):
+    permission: str
+
 @app.post("/api/v1/users/{user_id}/check-permission")
 async def check_user_permission(
     user_id: str,
-    permission_name: str,
+    body: CheckPermissionRequest,
     db: Session = Depends(get_db)
 ):
     """
@@ -599,15 +602,15 @@ async def check_user_permission(
     
     Args:
         user_id: 用户ID
-        permission_name: 权限名称（格式：resource:action）
+        body.permission: 权限名称（格式：resource:action）
     
     Returns:
         {"has_permission": bool}
     """
-    has_permission = check_permission(user_id, permission_name, db)
+    has_permission = check_permission(user_id, body.permission, db)
     return {
         "user_id": user_id,
-        "permission": permission_name,
+        "permission": body.permission,
         "has_permission": has_permission
     }
 

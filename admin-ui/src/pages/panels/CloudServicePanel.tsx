@@ -400,9 +400,11 @@ function ConfigForm({
     setTesting(true);
     try {
       const { data } = await cloudServiceApi.test(existing.id, {
-        to_email: testEmail,
-        subject: '测试邮件 - 统一认证平台',
-        body: '这是一封测试邮件，用于验证邮件服务配置是否正确。如果您收到此邮件，说明配置成功。',
+        test_email: {
+          to_email: testEmail,
+          subject: '测试邮件 - 统一认证平台',
+          body: '这是一封测试邮件，用于验证邮件服务配置是否正确。如果您收到此邮件，说明配置成功。',
+        },
       });
       if (data.success) {
         message.success('测试邮件已发送，请检查收件箱');

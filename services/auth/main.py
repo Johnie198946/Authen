@@ -694,7 +694,7 @@ async def send_email_code(request: SendEmailCodeRequest):
     # 调用 EmailService 发送验证码邮件
     email_svc = EmailService()
     send_ok = email_svc.send_verification_code_email(request.email, code)
-    if not send_ok:
+    if not send_ok and not settings.DEBUG:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="邮件发送失败，请稍后重试"
@@ -702,7 +702,7 @@ async def send_email_code(request: SendEmailCodeRequest):
 
     return {
         "success": True,
-        "message": "验证码已发送",
+        "message": "验证码已发送" if send_ok else "验证码已生成（开发模式，邮件未发送）",
         "code": code if settings.DEBUG else None
     }
 

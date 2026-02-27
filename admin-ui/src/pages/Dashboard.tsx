@@ -26,7 +26,7 @@ const { Title } = Typography;
 function OverviewPanel() {
   const [health, setHealth] = useState<any>(null);
   useEffect(() => {
-    axios.get('http://localhost:8001/health').then(r => setHealth(r.data)).catch(() => {});
+    axios.get('/health').then(r => setHealth(r.data)).catch(() => {});
   }, []);
   return (
     <>

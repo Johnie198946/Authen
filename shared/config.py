@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     
     # CORS配置
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
+    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"]
     
     # OAuth配置
     # 微信OAuth

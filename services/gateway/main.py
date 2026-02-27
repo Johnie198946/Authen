@@ -621,6 +621,43 @@ def _apply_auto_provision(app_data: dict, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/gateway/auth/send-email-code
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/gateway/auth/send-email-code")
+async def gateway_send_email_code(request: Request):
+    """
+    发送邮箱验证码端点。
+
+    流水线: 凭证验证 → email 登录方式检查 → auth:register Scope 检查 → 限流 → 路由到 Auth Service
+    """
+    app_data = await _run_auth_pipeline(request, "email", "auth/register/email")
+    request_id = getattr(request.state, "request_id", None)
+
+    body = await request.json()
+
+    router = get_service_router()
+    result = await router.forward("auth", "POST", "/api/v1/auth/send-email-code", json=body)
+
+    status_code = result["status_code"]
+    resp_body = result["body"]
+
+    if status_code >= 400:
+        error_code = resp_body.get("error_code", "upstream_error")
+        message = resp_body.get("message", "发送验证码失败")
+        response = create_error_response(status_code, error_code, message, request_id)
+        return _inject_rate_limit_headers(response, request)
+
+    if request_id:
+        resp_body["request_id"] = request_id
+
+    response = JSONResponse(status_code=status_code, content=resp_body)
+    if request_id:
+        response.headers["X-Request-Id"] = request_id
+    return _inject_rate_limit_headers(response, request)
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/gateway/auth/register/email
 # ---------------------------------------------------------------------------
 
@@ -1113,7 +1150,7 @@ async def gateway_get_user_roles(user_id: str, request: Request):
     request_id = getattr(request.state, "request_id", None)
 
     router = get_service_router()
-    result = await router.forward("permission", "GET", f"/api/v1/permissions/users/{user_id}/roles")
+    result = await router.forward("permission", "GET", f"/api/v1/users/{user_id}/roles")
 
     status_code = result["status_code"]
     resp_body = result["body"]
@@ -1152,7 +1189,7 @@ async def gateway_check_user_permission(user_id: str, request: Request):
     body = await request.json()
 
     router = get_service_router()
-    result = await router.forward("permission", "POST", f"/api/v1/permissions/users/{user_id}/check", json=body)
+    result = await router.forward("permission", "POST", f"/api/v1/users/{user_id}/check-permission", json=body)
 
     status_code = result["status_code"]
     resp_body = result["body"]

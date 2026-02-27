@@ -13,6 +13,7 @@ from jinja2 import Template, TemplateError
 from sqlalchemy.orm import Session
 from shared.database import get_db
 from shared.models.system import CloudServiceConfig, MessageTemplate
+from shared.utils.crypto import decrypt_config
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,14 @@ class EmailService:
                 ).first()
                 
                 if config:
-                    self.smtp_config = config.config
+                    # 解密配置
+                    if isinstance(config.config, str):
+                        self.smtp_config = decrypt_config(config.config)
+                    elif isinstance(config.config, dict):
+                        self.smtp_config = config.config
+                    else:
+                        logger.error("SMTP配置格式无效")
+                        return False
                     logger.info(f"成功加载SMTP配置: {config.provider}")
                     return True
                 else:

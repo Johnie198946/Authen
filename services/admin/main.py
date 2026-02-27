@@ -5,7 +5,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -965,8 +965,8 @@ class TestResponse(BaseModel):
 @app.post("/api/v1/admin/cloud-services/{config_id}/test", response_model=TestResponse)
 async def test_cloud_service_config(
     config_id: str,
-    test_email: Optional[TestEmailRequest] = None,
-    test_sms: Optional[TestSMSRequest] = None,
+    test_email: Optional[TestEmailRequest] = Body(None),
+    test_sms: Optional[TestSMSRequest] = Body(None),
     user_id: str = Depends(require_super_admin),
     db: Session = Depends(get_db)
 ):
