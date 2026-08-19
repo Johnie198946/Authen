@@ -91,7 +91,7 @@ def upgrade() -> None:
     op.create_index("ix_org_grant_status", "organization_knowledge_grants", ["status"])
     op.create_index("ix_org_grant_expiry", "organization_knowledge_grants", ["effective_until"])
 
-    op.execute("""
+    op.get_bind().exec_driver_sql("""
     INSERT INTO subscription_plans
       (id, name, description, duration_days, price, features, is_active,
        request_quota, token_quota, quota_period_days, created_at, updated_at)
@@ -132,7 +132,7 @@ def upgrade() -> None:
     ON CONFLICT (application_id, plan_id) DO NOTHING;
     """)
 
-    op.execute("""
+    op.get_bind().exec_driver_sql("""
     INSERT INTO knowledge_packs
       (id, application_id, entitlement_key, name, description, status, is_selectable,
        sort_order, minimum_document_count, approved_document_count, freshness_percent, risk_label)
@@ -155,7 +155,7 @@ def upgrade() -> None:
     ON CONFLICT (application_id, entitlement_key) DO NOTHING;
     """)
 
-    op.execute("""
+    op.get_bind().exec_driver_sql("""
     INSERT INTO plan_knowledge_pack_policies
       (id, plan_id, application_id, max_pack_count, selectable_pack_ids, custom_only)
     SELECT gen_random_uuid(), p.plan_id::uuid, a.id, p.max_count,
