@@ -44,6 +44,12 @@ class SubscriptionPlan(Base):
     # 关系
     user_subscriptions = relationship("UserSubscription", back_populates="plan")
     organization_subscriptions = relationship("OrganizationSubscription", back_populates="plan")
+    organization_subscription_requests = relationship(
+        "OrganizationSubscriptionRequest", back_populates="target_plan"
+    )
+    knowledge_pack_policies = relationship(
+        "PlanKnowledgePackPolicy", back_populates="plan", cascade="all, delete-orphan"
+    )
 
 
 class UserSubscription(Base):
@@ -88,7 +94,125 @@ class OrganizationSubscription(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     plan = relationship("SubscriptionPlan", back_populates="organization_subscriptions")
+    knowledge_grants = relationship(
+        "OrganizationKnowledgeGrant", back_populates="subscription", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint("organization_id", "application_id", name="uq_org_subscription_app"),
     )
+
+
+class KnowledgePack(Base):
+    """Governed yellow-knowledge product; never represents red tenant content."""
+    __tablename__ = "knowledge_packs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    application_id = Column(
+        UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    entitlement_key = Column(String(120), nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default="", nullable=False)
+    status = Column(String(20), default="draft", nullable=False, index=True)
+    is_selectable = Column(Boolean, default=False, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    minimum_document_count = Column(Integer, default=5, nullable=False)
+    approved_document_count = Column(Integer, default=0, nullable=False)
+    freshness_percent = Column(Integer, default=0, nullable=False)
+    risk_label = Column(String(80), default="黄色受限知识", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    grants = relationship("OrganizationKnowledgeGrant", back_populates="knowledge_pack")
+
+    __table_args__ = (
+        UniqueConstraint("application_id", "entitlement_key", name="uq_knowledge_pack_app_key"),
+    )
+
+
+class PlanKnowledgePackPolicy(Base):
+    """Per-application pack allowance for a subscription plan."""
+    __tablename__ = "plan_knowledge_pack_policies"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    plan_id = Column(
+        UUID(as_uuid=True), ForeignKey("subscription_plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    application_id = Column(
+        UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    max_pack_count = Column(Integer, default=0, nullable=False)
+    selectable_pack_ids = Column(JSONBCompat, default=list, nullable=False)
+    custom_only = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    plan = relationship("SubscriptionPlan", back_populates="knowledge_pack_policies")
+
+    __table_args__ = (
+        UniqueConstraint("plan_id", "application_id", name="uq_plan_pack_policy_app"),
+    )
+
+
+class OrganizationKnowledgeGrant(Base):
+    """Auditable grant of one governed yellow pack to one organization subscription."""
+    __tablename__ = "organization_knowledge_grants"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_subscription_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("organization_subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    knowledge_pack_id = Column(
+        UUID(as_uuid=True), ForeignKey("knowledge_packs.id"), nullable=False, index=True
+    )
+    status = Column(String(20), default="active", nullable=False, index=True)
+    effective_from = Column(DateTime, nullable=False)
+    effective_until = Column(DateTime, nullable=False, index=True)
+    approved_by = Column(String(64), default="", nullable=False)
+    source_request_id = Column(String(160), default="", nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    subscription = relationship("OrganizationSubscription", back_populates="knowledge_grants")
+    knowledge_pack = relationship("KnowledgePack", back_populates="grants")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_subscription_id", "knowledge_pack_id", name="uq_org_subscription_pack_grant"
+        ),
+    )
+
+
+class OrganizationSubscriptionRequest(Base):
+    """Idempotent plan-and-pack request awaiting a platform-admin decision."""
+    __tablename__ = "organization_subscription_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    request_id = Column(String(160), unique=True, nullable=False, index=True)
+    organization_id = Column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    application_id = Column(
+        UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_plan_id = Column(
+        UUID(as_uuid=True), ForeignKey("subscription_plans.id"), nullable=False, index=True
+    )
+    requested_by = Column(String(64), nullable=False)
+    requested_pack_ids = Column(JSONBCompat, default=list, nullable=False)
+    requested_entitlements = Column(JSONBCompat, default=list, nullable=False)
+    reason = Column(Text, default="", nullable=False)
+    status = Column(String(20), default="pending", nullable=False, index=True)
+    reviewed_by = Column(String(64), default="", nullable=False)
+    review_note = Column(Text, default="", nullable=False)
+    approved_pack_ids = Column(JSONBCompat, default=list, nullable=False)
+    reviewed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    target_plan = relationship("SubscriptionPlan", back_populates="organization_subscription_requests")
