@@ -4,7 +4,12 @@
 from shared.models.user import User, OAuthAccount, RefreshToken, SSOSession
 from shared.models.permission import Role, Permission, RolePermission, UserRole
 from shared.models.organization import Organization, UserOrganization, OrganizationPermission
-from shared.models.subscription import SubscriptionPlan, UserSubscription, OrganizationSubscription
+from shared.models.subscription import (
+    OrganizationSubscription,
+    OrganizationSubscriptionRequest,
+    SubscriptionPlan,
+    UserSubscription,
+)
 from shared.models.system import CloudServiceConfig, MessageTemplate, AuditLog
 from shared.models.application import Application, AppLoginMethod, AppScope, AppUser
 from shared.models.quota import AppQuotaOverride, QuotaUsage
@@ -25,6 +30,7 @@ __all__ = [
     "SubscriptionPlan",
     "UserSubscription",
     "OrganizationSubscription",
+    "OrganizationSubscriptionRequest",
     "CloudServiceConfig",
     "MessageTemplate",
     "AuditLog",

@@ -44,6 +44,9 @@ class SubscriptionPlan(Base):
     # 关系
     user_subscriptions = relationship("UserSubscription", back_populates="plan")
     organization_subscriptions = relationship("OrganizationSubscription", back_populates="plan")
+    organization_subscription_requests = relationship(
+        "OrganizationSubscriptionRequest", back_populates="target_plan"
+    )
 
 
 class UserSubscription(Base):
@@ -92,3 +95,32 @@ class OrganizationSubscription(Base):
     __table_args__ = (
         UniqueConstraint("organization_id", "application_id", name="uq_org_subscription_app"),
     )
+
+
+class OrganizationSubscriptionRequest(Base):
+    """Auditable organization plan request awaiting a platform-admin decision."""
+    __tablename__ = "organization_subscription_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    request_id = Column(String(160), unique=True, nullable=False, index=True)
+    organization_id = Column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    application_id = Column(
+        UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_plan_id = Column(
+        UUID(as_uuid=True), ForeignKey("subscription_plans.id"), nullable=False, index=True
+    )
+    requested_by = Column(String(64), nullable=False)
+    requested_entitlements = Column(JSONBCompat, default=list, nullable=False)
+    reason = Column(Text, default="", nullable=False)
+    status = Column(String(20), default="pending", nullable=False, index=True)
+    reviewed_by = Column(String(64), default="", nullable=False)
+    review_note = Column(Text, default="", nullable=False)
+    reviewed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    target_plan = relationship("SubscriptionPlan", back_populates="organization_subscription_requests")
+    application = relationship("Application")

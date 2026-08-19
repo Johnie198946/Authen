@@ -109,3 +109,62 @@ async def test_public_plan_response_includes_features(entitlement_client):
         response = await client.get("/api/v1/subscriptions/plans")
     assert response.status_code == 200
     assert response.json()[0]["features"]["knowledge_entitlements"] == ["premium_research"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_request_is_idempotent_and_approvable(entitlement_client):
+    transport, ids = entitlement_client
+    headers = {"Authorization": "Bearer platform-test"}
+    create_path = (
+        f"/api/v1/internal/organizations/{ids['org']}/subscription-requests"
+        "?app_id=ai-lab-platform"
+    )
+    body = {
+        "request_id": "ios-request-001",
+        "plan_id": ids["plan"],
+        "requested_by": "user-001",
+        "requested_entitlements": ["premium_research"],
+        "reason": "Need the research knowledge pack",
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(create_path, json=body, headers=headers)
+        duplicate = await client.post(create_path, json=body, headers=headers)
+        request_id = first.json()["id"]
+        approved = await client.post(
+            f"/api/v1/internal/admin/subscription-requests/{request_id}/approve"
+            "?app_id=ai-lab-platform",
+            json={"reviewed_by": "admin-001", "review_note": "approved"},
+            headers=headers,
+        )
+        center = await client.get(
+            f"/api/v1/internal/organizations/{ids['org']}/subscription-center"
+            "?app_id=ai-lab-platform",
+            headers=headers,
+        )
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == request_id
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert center.status_code == 200
+    assert center.json()["subscription"]["entitlement_version"] == 4
+
+
+@pytest.mark.asyncio
+async def test_subscription_request_rejects_entitlement_outside_plan(entitlement_client):
+    transport, ids = entitlement_client
+    headers = {"Authorization": "Bearer platform-test"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/internal/organizations/{ids['org']}/subscription-requests"
+            "?app_id=ai-lab-platform",
+            json={
+                "request_id": "ios-request-unsafe",
+                "plan_id": ids["plan"],
+                "requested_by": "user-001",
+                "requested_entitlements": ["not_in_plan"],
+            },
+            headers=headers,
+        )
+    assert response.status_code == 422
