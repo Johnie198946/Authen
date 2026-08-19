@@ -10,12 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 import json
 import traceback
+import hashlib
+import hmac
+import secrets
+import uuid as uuid_lib
+import httpx
 from shared.database import get_db
-from shared.models.subscription import SubscriptionPlan, UserSubscription
+from shared.models.subscription import SubscriptionPlan, UserSubscription, OrganizationSubscription
 from shared.models.application import Application, AppSubscriptionPlan
 from shared.models.quota import AppQuotaOverride, QuotaUsage
 from shared.models.webhook import WebhookEventLog
@@ -60,6 +65,7 @@ class PlanResponse(BaseModel):
     request_quota: int
     token_quota: int
     quota_period_days: int
+    features: Optional[dict] = None
 
 class SubscriptionCreate(BaseModel):
     plan_id: str
@@ -74,6 +80,128 @@ class SubscriptionResponse(BaseModel):
     end_date: datetime
     auto_renew: bool
 
+
+class OrganizationSubscriptionCreate(BaseModel):
+    plan_id: str
+    auto_renew: bool = True
+
+
+class OrganizationSubscriptionResponse(BaseModel):
+    id: str
+    organization_id: str
+    application_id: str
+    plan_id: str
+    status: str
+    start_date: datetime
+    end_date: datetime
+    auto_renew: bool
+    entitlement_version: int
+
+
+def _require_bearer(request: Request, expected: str, purpose: str) -> None:
+    if not expected:
+        raise HTTPException(status_code=503, detail=f"{purpose} token is not configured")
+    supplied = request.headers.get("authorization", "")
+    if not supplied.startswith("Bearer ") or not secrets.compare_digest(supplied[7:], expected):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+
+def require_subscription_admin(request: Request) -> None:
+    _require_bearer(request, settings.SUBSCRIPTION_ADMIN_TOKEN, "subscription admin")
+
+
+def require_ai_platform_service(request: Request) -> None:
+    _require_bearer(request, settings.AI_PLATFORM_SERVICE_TOKEN, "AI Platform service")
+
+
+def _knowledge_entitlements(plan: SubscriptionPlan) -> List[str]:
+    features = plan.features if isinstance(plan.features, dict) else {}
+    raw = features.get("knowledge_entitlements", [])
+    if not isinstance(raw, list):
+        return []
+    result: List[str] = []
+    for value in raw:
+        key = str(value).strip()
+        if key and "*" not in key and ".." not in key and "/" not in key and "\\" not in key:
+            result.append(key)
+    return sorted(set(result))
+
+
+def _validate_plan_features(features: Optional[dict]) -> None:
+    if features is None:
+        return
+    values = features.get("knowledge_entitlements", [])
+    if not isinstance(values, list) or any(
+        not isinstance(value, str)
+        or not value.strip()
+        or any(part in value for part in ("*", "..", "/", "\\"))
+        for value in values
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="knowledge_entitlements must contain exact category IDs without paths or wildcards",
+        )
+
+
+def _plan_response(plan: SubscriptionPlan) -> PlanResponse:
+    return PlanResponse(
+        id=str(plan.id), name=plan.name, description=plan.description,
+        duration_days=plan.duration_days, price=float(plan.price), is_active=plan.is_active,
+        request_quota=plan.request_quota, token_quota=plan.token_quota,
+        quota_period_days=plan.quota_period_days, features=plan.features,
+    )
+
+
+def _organization_subscription_response(sub: OrganizationSubscription) -> OrganizationSubscriptionResponse:
+    return OrganizationSubscriptionResponse(
+        id=str(sub.id), organization_id=str(sub.organization_id), application_id=str(sub.application_id),
+        plan_id=str(sub.plan_id), status=sub.status, start_date=sub.start_date, end_date=sub.end_date,
+        auto_renew=sub.auto_renew, entitlement_version=sub.entitlement_version,
+    )
+
+
+async def _push_entitlement_changed(sub_id: str) -> None:
+    """Best-effort projection update; the platform also performs periodic reconciliation."""
+    if not settings.AI_PLATFORM_ENTITLEMENT_WEBHOOK_URL or not settings.AI_PLATFORM_ENTITLEMENT_WEBHOOK_SECRET:
+        return
+    db = next(get_db())
+    try:
+        sub = db.query(OrganizationSubscription).filter(OrganizationSubscription.id == uuid_lib.UUID(sub_id)).first()
+        if not sub:
+            return
+        app = db.query(Application).filter(Application.id == sub.application_id).first()
+        plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == sub.plan_id).first()
+        if not app or not plan:
+            return
+        payload: Dict[str, Any] = {
+            "event_id": f"entitlement:{sub.id}:{sub.entitlement_version}",
+            "event_type": "entitlement.changed",
+            "organization_id": str(sub.organization_id),
+            "application_id": app.app_id,
+            "plan_id": str(plan.id),
+            "status": sub.status,
+            "effective_until": sub.end_date.isoformat(),
+            "knowledge_entitlements": _knowledge_entitlements(plan),
+            "request_quota": plan.request_quota,
+            "token_quota": plan.token_quota,
+            "entitlement_version": sub.entitlement_version,
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        signature = hmac.new(
+            settings.AI_PLATFORM_ENTITLEMENT_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+        ).hexdigest()
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.post(
+                settings.AI_PLATFORM_ENTITLEMENT_WEBHOOK_URL,
+                content=body,
+                headers={"content-type": "application/json", "x-webhook-signature": signature},
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        logger.warning("entitlement.changed delivery failed for %s: %s", sub_id, exc)
+    finally:
+        db.close()
+
 @app.get("/")
 async def root():
     return {"service": "订阅服务", "status": "running"}
@@ -82,11 +210,12 @@ async def root():
 async def list_plans(db: Session = Depends(get_db)):
     """获取订阅计划列表"""
     plans = db.query(SubscriptionPlan).filter(SubscriptionPlan.is_active == True).all()
-    return [PlanResponse(id=str(p.id), name=p.name, description=p.description, duration_days=p.duration_days, price=float(p.price), is_active=p.is_active, request_quota=p.request_quota, token_quota=p.token_quota, quota_period_days=p.quota_period_days) for p in plans]
+    return [_plan_response(p) for p in plans]
 
 @app.post("/api/v1/subscriptions/plans", response_model=PlanResponse)
-async def create_plan(plan_data: PlanCreate, db: Session = Depends(get_db)):
+async def create_plan(plan_data: PlanCreate, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """创建订阅计划"""
+    _validate_plan_features(plan_data.features)
     # 验证配额值
     if plan_data.request_quota is not None and plan_data.request_quota < -1:
         raise HTTPException(status_code=400, detail={"error_code": "invalid_quota_value", "message": "request_quota 必须 >= -1"})
@@ -107,10 +236,10 @@ async def create_plan(plan_data: PlanCreate, db: Session = Depends(get_db)):
     db.add(plan)
     db.commit()
     db.refresh(plan)
-    return PlanResponse(id=str(plan.id), name=plan.name, description=plan.description, duration_days=plan.duration_days, price=float(plan.price), is_active=plan.is_active, request_quota=plan.request_quota, token_quota=plan.token_quota, quota_period_days=plan.quota_period_days)
+    return _plan_response(plan)
 
 @app.put("/api/v1/subscriptions/plans/{plan_id}", response_model=PlanResponse)
-async def update_plan(plan_id: str, plan_data: PlanCreate, db: Session = Depends(get_db)):
+async def update_plan(plan_id: str, plan_data: PlanCreate, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """更新订阅计划"""
     import uuid as uuid_lib
     try:
@@ -120,6 +249,7 @@ async def update_plan(plan_id: str, plan_data: PlanCreate, db: Session = Depends
     plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == plan_uuid).first()
     if not plan:
         raise HTTPException(status_code=404, detail="订阅计划不存在")
+    _validate_plan_features(plan_data.features)
     # 验证配额值
     if plan_data.request_quota is not None and plan_data.request_quota < -1:
         raise HTTPException(status_code=400, detail={"error_code": "invalid_quota_value", "message": "request_quota 必须 >= -1"})
@@ -141,10 +271,10 @@ async def update_plan(plan_id: str, plan_data: PlanCreate, db: Session = Depends
         plan.quota_period_days = plan_data.quota_period_days
     db.commit()
     db.refresh(plan)
-    return PlanResponse(id=str(plan.id), name=plan.name, description=plan.description, duration_days=plan.duration_days, price=float(plan.price), is_active=plan.is_active, request_quota=plan.request_quota, token_quota=plan.token_quota, quota_period_days=plan.quota_period_days)
+    return _plan_response(plan)
 
 @app.delete("/api/v1/subscriptions/plans/{plan_id}")
-async def delete_plan(plan_id: str, db: Session = Depends(get_db)):
+async def delete_plan(plan_id: str, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """删除订阅计划（软删除，设为不活跃）"""
     import uuid as uuid_lib
     try:
@@ -163,7 +293,7 @@ async def delete_plan(plan_id: str, db: Session = Depends(get_db)):
     return {"success": True, "message": "订阅计划已停用"}
 
 @app.get("/api/v1/users/{user_id}/subscription")
-async def get_user_subscription(user_id: str, db: Session = Depends(get_db)):
+async def get_user_subscription(user_id: str, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """获取用户订阅"""
     import uuid as uuid_lib
     try:
@@ -177,7 +307,7 @@ async def get_user_subscription(user_id: str, db: Session = Depends(get_db)):
     return SubscriptionResponse(id=str(sub.id), user_id=str(sub.user_id), plan_id=str(sub.plan_id), status=sub.status, start_date=sub.start_date, end_date=sub.end_date, auto_renew=sub.auto_renew)
 
 @app.post("/api/v1/users/{user_id}/subscription", response_model=SubscriptionResponse)
-async def create_subscription(user_id: str, sub_data: SubscriptionCreate, db: Session = Depends(get_db)):
+async def create_subscription(user_id: str, sub_data: SubscriptionCreate, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """创建用户订阅"""
     import uuid as uuid_lib
     # Convert string IDs to UUID objects for database queries
@@ -205,7 +335,7 @@ async def create_subscription(user_id: str, sub_data: SubscriptionCreate, db: Se
     return SubscriptionResponse(id=str(subscription.id), user_id=str(subscription.user_id), plan_id=str(subscription.plan_id), status=subscription.status, start_date=subscription.start_date, end_date=subscription.end_date, auto_renew=subscription.auto_renew)
 
 @app.delete("/api/v1/users/{user_id}/subscription")
-async def cancel_subscription(user_id: str, db: Session = Depends(get_db)):
+async def cancel_subscription(user_id: str, db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """取消用户订阅"""
     import uuid as uuid_lib
     try:
@@ -219,6 +349,133 @@ async def cancel_subscription(user_id: str, db: Session = Depends(get_db)):
     sub.auto_renew = False
     db.commit()
     return {"success": True, "message": "订阅将在当前周期结束后停止"}
+
+
+@app.get(
+    "/api/v1/internal/organizations/{org_id}/entitlements",
+)
+async def get_organization_entitlements(
+    org_id: str,
+    app_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_ai_platform_service),
+):
+    """Return the effective organization entitlement projection to AI Platform only."""
+    try:
+        org_uuid = uuid_lib.UUID(org_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid organization id")
+    app = db.query(Application).filter(Application.app_id == app_id, Application.status == "active").first()
+    if not app:
+        raise HTTPException(status_code=404, detail="application not found")
+    sub = db.query(OrganizationSubscription).filter(
+        OrganizationSubscription.organization_id == org_uuid,
+        OrganizationSubscription.application_id == app.id,
+    ).first()
+    if not sub:
+        return {
+            "organization_id": org_id, "application_id": app_id, "plan_id": None,
+            "status": "none", "effective_until": None, "knowledge_entitlements": [],
+            "request_quota": 0, "token_quota": 0, "entitlement_version": 0,
+        }
+    plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == sub.plan_id).first()
+    now = datetime.utcnow()
+    effective_status = sub.status
+    if effective_status == "active" and sub.end_date <= now:
+        effective_status = "expired"
+    return {
+        "organization_id": org_id,
+        "application_id": app_id,
+        "plan_id": str(plan.id) if plan else None,
+        "plan_name": plan.name if plan else None,
+        "status": effective_status,
+        "effective_until": sub.end_date.isoformat(),
+        "knowledge_entitlements": _knowledge_entitlements(plan) if plan and effective_status == "active" else [],
+        "request_quota": plan.request_quota if plan else 0,
+        "token_quota": plan.token_quota if plan else 0,
+        "entitlement_version": sub.entitlement_version,
+    }
+
+
+@app.put(
+    "/api/v1/admin/organizations/{org_id}/subscriptions/{app_id}",
+    response_model=OrganizationSubscriptionResponse,
+)
+async def upsert_organization_subscription(
+    org_id: str,
+    app_id: str,
+    data: OrganizationSubscriptionCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_subscription_admin),
+):
+    try:
+        org_uuid = uuid_lib.UUID(org_id)
+        plan_uuid = uuid_lib.UUID(data.plan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid id")
+    app = db.query(Application).filter(Application.app_id == app_id, Application.status == "active").first()
+    plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == plan_uuid, SubscriptionPlan.is_active == True).first()
+    if not app or not plan:
+        raise HTTPException(status_code=404, detail="application or plan not found")
+    allowed = db.query(AppSubscriptionPlan).filter(
+        AppSubscriptionPlan.application_id == app.id,
+        AppSubscriptionPlan.plan_id == plan.id,
+    ).first()
+    if not allowed:
+        raise HTTPException(status_code=400, detail="plan is not bound to application")
+    now = datetime.utcnow()
+    sub = db.query(OrganizationSubscription).filter(
+        OrganizationSubscription.organization_id == org_uuid,
+        OrganizationSubscription.application_id == app.id,
+    ).first()
+    if sub:
+        sub.plan_id = plan.id
+        sub.status = "active"
+        sub.start_date = now
+        sub.end_date = now + timedelta(days=plan.duration_days)
+        sub.auto_renew = data.auto_renew
+        sub.entitlement_version += 1
+    else:
+        sub = OrganizationSubscription(
+            organization_id=org_uuid, application_id=app.id, plan_id=plan.id,
+            status="active", start_date=now, end_date=now + timedelta(days=plan.duration_days),
+            auto_renew=data.auto_renew, entitlement_version=1,
+        )
+        db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    background_tasks.add_task(_push_entitlement_changed, str(sub.id))
+    return _organization_subscription_response(sub)
+
+
+@app.delete("/api/v1/admin/organizations/{org_id}/subscriptions/{app_id}")
+async def cancel_organization_subscription(
+    org_id: str,
+    app_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_subscription_admin),
+):
+    try:
+        org_uuid = uuid_lib.UUID(org_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid organization id")
+    app = db.query(Application).filter(Application.app_id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="application not found")
+    sub = db.query(OrganizationSubscription).filter(
+        OrganizationSubscription.organization_id == org_uuid,
+        OrganizationSubscription.application_id == app.id,
+    ).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="organization subscription not found")
+    sub.status = "cancelled"
+    sub.auto_renew = False
+    sub.entitlement_version += 1
+    db.commit()
+    background_tasks.add_task(_push_entitlement_changed, str(sub.id))
+    return {"success": True, "entitlement_version": sub.entitlement_version}
 
 
 def process_expired_subscriptions(db: Session) -> dict:
@@ -246,12 +503,25 @@ def process_expired_subscriptions(db: Session) -> dict:
         processed_count += 1
         
         logger.info(f"Expired subscription {sub.id} for user {sub.user_id}")
+
+    expired_org_subs = db.query(OrganizationSubscription).filter(
+        OrganizationSubscription.status == "active",
+        OrganizationSubscription.end_date <= now,
+    ).all()
+    changed_org_ids: List[str] = []
+    for sub in expired_org_subs:
+        sub.status = "expired"
+        sub.auto_renew = False
+        sub.entitlement_version += 1
+        sub.updated_at = now
+        changed_org_ids.append(str(sub.id))
     
     db.commit()
     
     return {
         "processed": processed_count,
-        "timestamp": now.isoformat()
+        "timestamp": now.isoformat(),
+        "organization_subscription_ids": changed_org_ids,
     }
 
 
@@ -448,7 +718,7 @@ def process_quota_resets(db: Session) -> dict:
 
 
 @app.post("/api/v1/admin/subscriptions/process-quota-resets")
-async def trigger_quota_reset_processing(db: Session = Depends(get_db)):
+async def trigger_quota_reset_processing(db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """
     手动触发配额重置处理（管理员接口）
 
@@ -460,7 +730,11 @@ async def trigger_quota_reset_processing(db: Session = Depends(get_db)):
 
 
 @app.post("/api/v1/admin/subscriptions/process-expired")
-async def trigger_expiration_processing(db: Session = Depends(get_db)):
+async def trigger_expiration_processing(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_subscription_admin),
+):
     """
     手动触发订阅到期处理（管理员接口）
     
@@ -468,11 +742,13 @@ async def trigger_expiration_processing(db: Session = Depends(get_db)):
     在生产环境中，应该由定时任务自动调用 process_expired_subscriptions 函数。
     """
     result = process_expired_subscriptions(db)
+    for sub_id in result.pop("organization_subscription_ids", []):
+        background_tasks.add_task(_push_entitlement_changed, sub_id)
     return result
 
 
 @app.post("/api/v1/admin/subscriptions/send-reminders")
-async def trigger_reminder_sending(db: Session = Depends(get_db)):
+async def trigger_reminder_sending(db: Session = Depends(get_db), _: None = Depends(require_subscription_admin)):
     """
     手动触发订阅到期提醒发送（管理员接口）
     

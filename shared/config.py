@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     APP_NAME: str = "Unified Auth Platform"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
+
+    # 服务间与订阅管理鉴权。生产环境必须通过环境变量覆盖。
+    AI_PLATFORM_SERVICE_TOKEN: str = ""
+    SUBSCRIPTION_ADMIN_TOKEN: str = ""
+    AI_PLATFORM_ENTITLEMENT_WEBHOOK_URL: str = ""
+    AI_PLATFORM_ENTITLEMENT_WEBHOOK_SECRET: str = ""
     
     # CORS配置
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"]

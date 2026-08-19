@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Boolean, ForeignKey, Text, Numeric
+from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Boolean, ForeignKey, Text, Numeric, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.types import TypeDecorator, JSON
 from sqlalchemy.orm import relationship
@@ -43,6 +43,7 @@ class SubscriptionPlan(Base):
     
     # 关系
     user_subscriptions = relationship("UserSubscription", back_populates="plan")
+    organization_subscriptions = relationship("OrganizationSubscription", back_populates="plan")
 
 
 class UserSubscription(Base):
@@ -62,3 +63,32 @@ class UserSubscription(Base):
     # 关系
     user = relationship("User", back_populates="subscriptions")
     plan = relationship("SubscriptionPlan", back_populates="user_subscriptions")
+
+
+class OrganizationSubscription(Base):
+    """组织在指定应用下的套餐，是共享租户知识权益的唯一计费真源。"""
+    __tablename__ = "organization_subscriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    application_id = Column(
+        UUID(as_uuid=True), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    plan_id = Column(
+        UUID(as_uuid=True), ForeignKey("subscription_plans.id"), nullable=False, index=True
+    )
+    status = Column(String(20), default="active", nullable=False, index=True)
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime, nullable=False, index=True)
+    auto_renew = Column(Boolean, default=True, nullable=False)
+    entitlement_version = Column(BigInteger, default=1, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    plan = relationship("SubscriptionPlan", back_populates="organization_subscriptions")
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "application_id", name="uq_org_subscription_app"),
+    )
