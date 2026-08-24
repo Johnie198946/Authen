@@ -38,7 +38,14 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def setup_and_teardown():
+def setup_and_teardown(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-test-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-test-secret")
+    monkeypatch.setenv("WECHAT_APP_ID", "wechat-test-id")
+    monkeypatch.setenv("WECHAT_APP_SECRET", "wechat-test-secret")
+    monkeypatch.setenv("ALIPAY_APP_ID", "alipay-test-id")
+    monkeypatch.setenv("ALIPAY_APP_PRIVATE_KEY", "alipay-test-private-key")
+    monkeypatch.setenv("ALIPAY_PUBLIC_KEY", "alipay-test-public-key")
     """每个测试前后的设置和清理"""
     # 清理数据库
     Base.metadata.drop_all(bind=engine)
@@ -114,7 +121,7 @@ class TestOAuthAuthentication:
         ).first()
         assert oauth_account is not None
         assert oauth_account.user_id == user.id
-        assert oauth_account.access_token == "google_access_token_123"
+        assert oauth_account.access_token is None
         
         db.close()
     
@@ -184,8 +191,8 @@ class TestOAuthAuthentication:
             OAuthAccount.provider == "google",
             OAuthAccount.provider_user_id == "google_user_existing"
         ).first()
-        assert oauth_account.access_token == "new_google_token"
-        assert oauth_account.refresh_token == "new_google_refresh"
+        assert oauth_account.access_token is None
+        assert oauth_account.refresh_token is None
         db.close()
     
     @patch('shared.utils.oauth_client.GoogleOAuthClient.exchange_code_for_token')

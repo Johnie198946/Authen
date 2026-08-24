@@ -6,16 +6,32 @@ OAuth客户端基类和各提供商实现
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime
+import base64
+import json
+from urllib.parse import urlencode
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 
 class OAuthClient(ABC):
     """OAuth客户端基类"""
     
-    def __init__(self, client_id: str, client_secret: str, redirect_uri: str):
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        redirect_uri: str,
+        *,
+        provider_public_key: str = "",
+        mode: str = "",
+    ):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
+        self.provider_public_key = provider_public_key
+        self.mode = mode
     
     @abstractmethod
     async def get_authorization_url(self, state: str) -> str:
@@ -36,21 +52,23 @@ class OAuthClient(ABC):
 class WeChatOAuthClient(OAuthClient):
     """微信OAuth客户端"""
     
-    AUTH_URL = "https://open.weixin.qq.com/connect/oauth2/authorize"
+    WEBSITE_AUTH_URL = "https://open.weixin.qq.com/connect/qrconnect"
+    PUBLIC_ACCOUNT_AUTH_URL = "https://open.weixin.qq.com/connect/oauth2/authorize"
     TOKEN_URL = "https://api.weixin.qq.com/sns/oauth2/access_token"
     USERINFO_URL = "https://api.weixin.qq.com/sns/userinfo"
     
     async def get_authorization_url(self, state: str) -> str:
         """获取微信授权URL"""
+        website_mode = self.mode != "public_account"
         params = {
             "appid": self.client_id,
             "redirect_uri": self.redirect_uri,
             "response_type": "code",
-            "scope": "snsapi_userinfo",
+            "scope": "snsapi_login" if website_mode else "snsapi_userinfo",
             "state": state
         }
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        return f"{self.AUTH_URL}?{query_string}#wechat_redirect"
+        auth_url = self.WEBSITE_AUTH_URL if website_mode else self.PUBLIC_ACCOUNT_AUTH_URL
+        return f"{auth_url}?{urlencode(params)}#wechat_redirect"
     
     async def exchange_code_for_token(self, code: str) -> Dict:
         """用授权码交换微信访问令牌"""
@@ -97,6 +115,7 @@ class WeChatOAuthClient(OAuthClient):
                 "username": data.get("nickname", f"wechat_{data['openid'][:8]}"),
                 "avatar": data.get("headimgurl"),
                 "extra": {
+                    "unionid": data.get("unionid"),
                     "nickname": data.get("nickname"),
                     "sex": data.get("sex"),
                     "province": data.get("province"),
@@ -120,94 +139,116 @@ class AlipayOAuthClient(OAuthClient):
             "redirect_uri": self.redirect_uri,
             "state": state
         }
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        return f"{self.AUTH_URL}?{query_string}"
-    
-    async def exchange_code_for_token(self, code: str) -> Dict:
-        """用授权码交换支付宝访问令牌"""
-        # 支付宝需要使用RSA签名，这里简化实现
-        # 实际生产环境需要使用支付宝SDK
+        return f"{self.AUTH_URL}?{urlencode(params)}"
+
+    @staticmethod
+    def _pem(value: str, label: str) -> bytes:
+        value = value.strip()
+        if "BEGIN" not in value:
+            value = f"-----BEGIN {label}-----\n{value}\n-----END {label}-----"
+        return value.encode("utf-8")
+
+    def _sign(self, params: Dict[str, str]) -> str:
+        unsigned = "&".join(
+            f"{key}={params[key]}"
+            for key in sorted(params)
+            if key not in {"sign", "sign_type"} and params[key] not in (None, "")
+        )
+        private_key = serialization.load_pem_private_key(
+            self._pem(self.client_secret, "PRIVATE KEY"), password=None
+        )
+        signature = private_key.sign(
+            unsigned.encode("utf-8"), padding.PKCS1v15(), hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode("ascii")
+
+    def _verify(self, content: str, signature: str) -> None:
+        public_key = serialization.load_pem_public_key(
+            self._pem(self.provider_public_key, "PUBLIC KEY")
+        )
+        public_key.verify(
+            base64.b64decode(signature),
+            content.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+
+    @staticmethod
+    def _signed_response_content(raw: str, response_key: str) -> str:
+        marker = json.dumps(response_key, ensure_ascii=False)
+        marker_index = raw.find(marker)
+        if marker_index < 0:
+            raise ValueError(f"支付宝响应缺少 {response_key}")
+        value_start = raw.find(":", marker_index + len(marker)) + 1
+        while value_start < len(raw) and raw[value_start].isspace():
+            value_start += 1
+        _, consumed = json.JSONDecoder().raw_decode(raw[value_start:])
+        return raw[value_start : value_start + consumed]
+
+    async def _gateway_call(self, method: str, response_key: str, **api_params: str) -> Dict:
         params = {
             "app_id": self.client_id,
-            "method": "alipay.system.oauth.token",
+            "method": method,
             "format": "JSON",
             "charset": "utf-8",
             "sign_type": "RSA2",
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "version": "1.0",
-            "grant_type": "authorization_code",
-            "code": code
+            **api_params,
         }
-        
-        # TODO: 添加RSA签名
-        # 这里返回模拟数据，实际需要调用支付宝API
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(self.TOKEN_URL, data=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                if "error_response" in data:
-                    raise Exception(f"支付宝OAuth错误: {data['error_response'].get('sub_msg', '未知错误')}")
-                
-                token_response = data.get("alipay_system_oauth_token_response", {})
-                return {
-                    "access_token": token_response["access_token"],
-                    "refresh_token": token_response.get("refresh_token"),
-                    "expires_in": token_response.get("expires_in", 86400),
-                    "user_id": token_response["user_id"]
-                }
-            except Exception as e:
-                # 开发环境返回模拟数据
-                return {
-                    "access_token": f"alipay_mock_token_{code[:10]}",
-                    "refresh_token": f"alipay_mock_refresh_{code[:10]}",
-                    "expires_in": 86400,
-                    "user_id": f"alipay_user_{code[:8]}"
-                }
+        params["sign"] = self._sign(params)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(self.TOKEN_URL, data=params)
+            response.raise_for_status()
+        raw = response.text
+        data = response.json()
+        if "error_response" in data:
+            error = data["error_response"]
+            raise ValueError(error.get("sub_msg") or error.get("msg") or "支付宝OAuth错误")
+        signature = data.get("sign")
+        if not signature:
+            raise ValueError("支付宝响应缺少签名")
+        self._verify(self._signed_response_content(raw, response_key), signature)
+        result = data.get(response_key)
+        if not isinstance(result, dict):
+            raise ValueError(f"支付宝响应缺少 {response_key}")
+        return result
+
+    async def exchange_code_for_token(self, code: str) -> Dict:
+        """用授权码交换支付宝访问令牌"""
+        token_response = await self._gateway_call(
+            "alipay.system.oauth.token",
+            "alipay_system_oauth_token_response",
+            grant_type="authorization_code",
+            code=code,
+        )
+        return {
+            "access_token": token_response["access_token"],
+            "refresh_token": token_response.get("refresh_token"),
+            "expires_in": int(token_response.get("expires_in", 86400)),
+            "user_id": token_response["user_id"],
+        }
     
     async def get_user_info(self, access_token: str, user_id: str = None) -> Dict:
         """获取支付宝用户信息"""
-        params = {
-            "app_id": self.client_id,
-            "method": "alipay.user.info.share",
-            "format": "JSON",
-            "charset": "utf-8",
-            "sign_type": "RSA2",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "version": "1.0",
-            "auth_token": access_token
+        user_info = await self._gateway_call(
+            "alipay.user.info.share",
+            "alipay_user_info_share_response",
+            auth_token=access_token,
+        )
+        provider_user_id = user_info.get("user_id") or user_id
+        if not provider_user_id:
+            raise ValueError("支付宝用户信息缺少 user_id")
+        return {
+            "provider_user_id": provider_user_id,
+            "username": user_info.get("nick_name", f"alipay_{provider_user_id[:8]}"),
+            "avatar": user_info.get("avatar"),
+            "extra": {
+                "nick_name": user_info.get("nick_name"),
+                "province": user_info.get("province"),
+                "city": user_info.get("city"),
+            },
         }
-        
-        # TODO: 添加RSA签名
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(self.TOKEN_URL, data=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                if "error_response" in data:
-                    raise Exception(f"获取支付宝用户信息错误: {data['error_response'].get('sub_msg', '未知错误')}")
-                
-                user_info = data.get("alipay_user_info_share_response", {})
-                return {
-                    "provider_user_id": user_info.get("user_id", user_id),
-                    "username": user_info.get("nick_name", f"alipay_{user_id[:8]}"),
-                    "avatar": user_info.get("avatar"),
-                    "extra": {
-                        "nick_name": user_info.get("nick_name"),
-                        "province": user_info.get("province"),
-                        "city": user_info.get("city")
-                    }
-                }
-            except Exception:
-                # 开发环境返回模拟数据
-                return {
-                    "provider_user_id": user_id or f"alipay_user_{access_token[:8]}",
-                    "username": f"alipay_{user_id[:8] if user_id else 'user'}",
-                    "avatar": None,
-                    "extra": {}
-                }
 
 
 class GoogleOAuthClient(OAuthClient):
@@ -372,7 +413,15 @@ class AppleOAuthClient(OAuthClient):
         }
 
 
-def get_oauth_client(provider: str, client_id: str, client_secret: str, redirect_uri: str) -> OAuthClient:
+def get_oauth_client(
+    provider: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    *,
+    provider_public_key: str = "",
+    mode: str = "",
+) -> OAuthClient:
     """获取OAuth客户端实例"""
     clients = {
         "wechat": WeChatOAuthClient,
@@ -385,4 +434,10 @@ def get_oauth_client(provider: str, client_id: str, client_secret: str, redirect
     if not client_class:
         raise ValueError(f"不支持的OAuth提供商: {provider}")
     
-    return client_class(client_id, client_secret, redirect_uri)
+    return client_class(
+        client_id,
+        client_secret,
+        redirect_uri,
+        provider_public_key=provider_public_key,
+        mode=mode,
+    )

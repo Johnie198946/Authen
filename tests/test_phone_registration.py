@@ -44,7 +44,11 @@ passwords = st.text(
 usernames = st.text(alphabet=st.characters(whitelist_categories=('Lu', 'Ll', 'Nd')), min_size=3, max_size=50)
 
 @pytest.fixture(autouse=True)
-def setup_database():
+def setup_database(monkeypatch):
+    monkeypatch.setattr(
+        "services.notification.sms_service.SMSService.send_verification_sms",
+        lambda self, phone, code: True,
+    )
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
@@ -122,3 +126,38 @@ def test_verification_code_format():
     assert verification_code is not None
     assert len(verification_code) == 6
     assert verification_code.isdigit()
+
+
+def test_phone_code_login_auto_registers_user():
+    phone = "+8613900139000"
+    assert client.post("/api/v1/auth/send-sms", json={"phone": phone}).status_code == 200
+    redis = get_redis()
+    code = redis.get(f"sms_code:{phone}")
+
+    response = client.post(
+        "/api/v1/auth/login/phone-code",
+        json={"phone": phone, "code": code},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["is_new_user"] is True
+    db = TestingSessionLocal()
+    try:
+        user = db.query(User).filter(User.phone == phone).one()
+        assert user.password_hash is None
+        assert user.status == "active"
+    finally:
+        db.close()
+
+
+def test_sms_failure_does_not_store_code(monkeypatch):
+    phone = "+8613700137000"
+    monkeypatch.setattr(
+        "services.notification.sms_service.SMSService.send_verification_sms",
+        lambda self, phone, code: False,
+    )
+
+    response = client.post("/api/v1/auth/send-sms", json={"phone": phone})
+
+    assert response.status_code == 503
+    assert get_redis().get(f"sms_code:{phone}") is None

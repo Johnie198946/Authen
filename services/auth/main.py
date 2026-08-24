@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -25,6 +26,12 @@ from shared.redis_client import get_redis
 from shared.config import settings
 from shared.middleware.api_logger import APILoggerMiddleware
 from shared.utils.health_check import check_overall_health
+from shared.oauth_settings import (
+    allow_debug_verification_codes,
+    allowed_redirect_uris,
+    get_provider_config,
+    validate_redirect_uri,
+)
 
 app = FastAPI(
     title="认证服务",
@@ -76,6 +83,7 @@ class LoginResponse(BaseModel):
     token_type: str = "Bearer"
     expires_in: int
     user: dict
+    is_new_user: bool = False
 
 
 class RefreshTokenRequest(BaseModel):
@@ -188,6 +196,38 @@ def verify_and_delete_code(redis_client, key: str, submitted_code: str) -> bool:
         return False
     redis_client.delete(key)
     return True
+
+
+SUPPORTED_OAUTH_PROVIDERS = ("wechat", "alipay", "google", "apple")
+
+
+def build_oauth_client(provider: str, redirect_uri: str):
+    from shared.utils.oauth_client import get_oauth_client
+
+    if provider not in SUPPORTED_OAUTH_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的OAuth提供商: {provider}",
+        )
+    if not validate_redirect_uri(redirect_uri, debug=settings.DEBUG):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth回调地址未获授权",
+        )
+    config = get_provider_config(provider)
+    if not config.is_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{provider} OAuth尚未配置",
+        )
+    return get_oauth_client(
+        provider=provider,
+        client_id=config.client_id,
+        client_secret=config.client_secret,
+        redirect_uri=redirect_uri,
+        provider_public_key=config.provider_public_key,
+        mode=config.mode,
+    )
 
 
 # ==================== API端点 ====================
@@ -639,22 +679,50 @@ async def send_sms_code(request: SendSMSRequest):
     # 生成6位验证码
     verification_code = ''.join([str(secrets.randbelow(10)) for _ in range(6)])
     
-    # 存储到Redis，5分钟过期
-    redis.setex(
-        f"sms_code:{request.phone}",
-        300,  # 5分钟
-        verification_code
+    from services.notification.sms_service import SMSService
+
+    sms_service = SMSService()
+    send_ok = await run_in_threadpool(
+        sms_service.send_verification_sms,
+        request.phone,
+        verification_code,
     )
-    
-    # 设置频率限制
+    debug_code_allowed = settings.DEBUG and allow_debug_verification_codes()
+    if not send_ok and not debug_code_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="短信服务尚未配置或发送失败",
+        )
+
+    # 只有短信已发出（或显式测试模式）后才保存验证码和启动限流。
+    redis.setex(f"sms_code:{request.phone}", 300, verification_code)
     set_rate_limit(redis, "sms", request.phone)
-    
-    # TODO: 调用通知服务发送短信
-    # 开发环境下直接返回验证码（生产环境应该删除）
+
     return {
         "success": True,
-        "message": "验证码已发送",
-        "code": verification_code if settings.DEBUG else None
+        "message": "验证码已发送" if send_ok else "验证码已生成（显式测试模式）",
+        "code": verification_code if debug_code_allowed else None,
+    }
+
+
+@app.get("/api/v1/auth/capabilities")
+async def auth_capabilities():
+    """Return only readiness metadata; never expose credentials."""
+    from services.notification.sms_service import SMSService
+
+    sms_configured = await run_in_threadpool(
+        lambda: SMSService().sms_client is not None
+    )
+    redirects_configured = bool(allowed_redirect_uris()) or settings.DEBUG
+    return {
+        "phone": {"enabled": sms_configured},
+        "oauth": {
+            provider: {
+                "enabled": get_provider_config(provider).is_configured
+                and redirects_configured
+            }
+            for provider in ("wechat", "alipay")
+        },
     }
 
 
@@ -726,13 +794,23 @@ async def login_with_phone_code(
             detail="验证码无效或已过期"
         )
 
-    # 查找用户
+    # 查找用户；验证码首次登录即创建无密码手机号账号。
     user = db.query(User).filter(User.phone == request.phone).first()
+    is_new_user = user is None
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户不存在"
+        base_username = f"phone_{request.phone[-4:]}"
+        username = base_username
+        while db.query(User).filter(User.username == username).first():
+            username = f"{base_username}_{secrets.token_hex(2)}"
+        user = User(
+            username=username,
+            phone=request.phone,
+            password_hash=None,
+            password_changed=True,
+            status="active",
         )
+        db.add(user)
+        db.flush()
 
     # 检查账号锁定
     if user.status == 'locked' or (user.locked_until and user.locked_until > datetime.utcnow()):
@@ -783,7 +861,8 @@ async def login_with_phone_code(
             "username": user.username,
             "email": user.email,
             "requires_password_change": not user.password_changed
-        }
+        },
+        is_new_user=is_new_user,
     )
 
 @app.post("/api/v1/auth/login/email-code", response_model=LoginResponse)
@@ -963,52 +1042,11 @@ async def oauth_authenticate(
     需求：1.3 - 通过OAuth协议完成认证并创建或关联账号
     支持的提供商：wechat, alipay, google, apple
     """
-    from shared.utils.oauth_client import get_oauth_client
     from shared.models.user import OAuthAccount
-    
-    # 验证提供商
-    supported_providers = ["wechat", "alipay", "google", "apple"]
-    if provider not in supported_providers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"不支持的OAuth提供商: {provider}"
-        )
-    
-    # 从环境变量获取OAuth配置
-    oauth_config = {
-        "wechat": {
-            "client_id": settings.WECHAT_APP_ID,
-            "client_secret": settings.WECHAT_APP_SECRET,
-        },
-        "alipay": {
-            "client_id": settings.ALIPAY_APP_ID,
-            "client_secret": settings.ALIPAY_APP_SECRET,
-        },
-        "google": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        },
-        "apple": {
-            "client_id": settings.APPLE_CLIENT_ID,
-            "client_secret": settings.APPLE_CLIENT_SECRET,
-        }
-    }
-    
-    config = oauth_config.get(provider, {})
-    if not config.get("client_id") or not config.get("client_secret"):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{provider} OAuth配置未设置"
-        )
     
     try:
         # 创建OAuth客户端
-        oauth_client = get_oauth_client(
-            provider=provider,
-            client_id=config["client_id"],
-            client_secret=config["client_secret"],
-            redirect_uri=request.redirect_uri
-        )
+        oauth_client = build_oauth_client(provider, request.redirect_uri)
         
         # 用授权码交换访问令牌
         token_data = await oauth_client.exchange_code_for_token(request.code)
@@ -1045,8 +1083,9 @@ async def oauth_authenticate(
         if oauth_account:
             # 已存在OAuth账号，更新令牌
             user = oauth_account.user
-            oauth_account.access_token = token_data["access_token"]
-            oauth_account.refresh_token = token_data.get("refresh_token")
+            # 登录仅需要一次性访问令牌；不在数据库持久化第三方令牌。
+            oauth_account.access_token = None
+            oauth_account.refresh_token = None
             if token_data.get("expires_in"):
                 oauth_account.token_expires_at = datetime.utcnow() + timedelta(
                     seconds=token_data["expires_in"]
@@ -1087,8 +1126,8 @@ async def oauth_authenticate(
                 user_id=user.id,
                 provider=provider,
                 provider_user_id=provider_user_id,
-                access_token=token_data["access_token"],
-                refresh_token=token_data.get("refresh_token"),
+                access_token=None,
+                refresh_token=None,
                 token_expires_at=datetime.utcnow() + timedelta(
                     seconds=token_data.get("expires_in", 3600)
                 ) if token_data.get("expires_in") else None
@@ -1143,52 +1182,11 @@ async def oauth_authorize(provider: str, redirect_uri: str, state: str = None):
     
     需求：1.3 - 重定向到OAuth提供商授权页面
     """
-    from shared.utils.oauth_client import get_oauth_client
     import secrets
-    
-    # 验证提供商
-    supported_providers = ["wechat", "alipay", "google", "apple"]
-    if provider not in supported_providers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"不支持的OAuth提供商: {provider}"
-        )
-    
-    # 从环境变量获取OAuth配置
-    oauth_config = {
-        "wechat": {
-            "client_id": settings.WECHAT_APP_ID,
-            "client_secret": settings.WECHAT_APP_SECRET,
-        },
-        "alipay": {
-            "client_id": settings.ALIPAY_APP_ID,
-            "client_secret": settings.ALIPAY_APP_SECRET,
-        },
-        "google": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        },
-        "apple": {
-            "client_id": settings.APPLE_CLIENT_ID,
-            "client_secret": settings.APPLE_CLIENT_SECRET,
-        }
-    }
-    
-    config = oauth_config.get(provider, {})
-    if not config.get("client_id") or not config.get("client_secret"):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{provider} OAuth配置未设置"
-        )
     
     try:
         # 创建OAuth客户端
-        oauth_client = get_oauth_client(
-            provider=provider,
-            client_id=config["client_id"],
-            client_secret=config["client_secret"],
-            redirect_uri=redirect_uri
-        )
+        oauth_client = build_oauth_client(provider, redirect_uri)
         
         # 生成state（如果未提供）
         if not state:
@@ -1202,6 +1200,8 @@ async def oauth_authorize(provider: str, redirect_uri: str, state: str = None):
             "state": state
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

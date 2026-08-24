@@ -86,7 +86,16 @@ oauth_tokens = st.text(
 
 
 @pytest.fixture(autouse=True)
-def setup_and_teardown():
+def setup_and_teardown(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-test-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-test-secret")
+    monkeypatch.setenv("WECHAT_APP_ID", "wechat-test-id")
+    monkeypatch.setenv("WECHAT_APP_SECRET", "wechat-test-secret")
+    monkeypatch.setenv("ALIPAY_APP_ID", "alipay-test-id")
+    monkeypatch.setenv("ALIPAY_APP_PRIVATE_KEY", "alipay-test-private-key")
+    monkeypatch.setenv("ALIPAY_PUBLIC_KEY", "alipay-test-public-key")
+    monkeypatch.setenv("APPLE_CLIENT_ID", "apple-test-id")
+    monkeypatch.setenv("APPLE_CLIENT_SECRET", "apple-test-secret")
     """每个测试前后的设置和清理"""
     # 清理数据库
     Base.metadata.drop_all(bind=engine)
@@ -269,7 +278,7 @@ class TestOAuthAccountLinking:
                 ).first()
                 assert oauth_account is not None, "应该创建OAuth账号关联"
                 assert oauth_account.user_id == user.id, "OAuth账号应该关联到正确的用户"
-                assert oauth_account.access_token == access_token, "应该存储OAuth访问令牌"
+                assert oauth_account.access_token is None, "不应持久化OAuth访问令牌"
                 
             finally:
                 db.close()
@@ -481,8 +490,8 @@ class TestOAuthAccountLinking:
                     OAuthAccount.provider == provider,
                     OAuthAccount.provider_user_id == oauth_user_id
                 ).first()
-                assert oauth_account.access_token == access_token1, \
-                    "应该存储第一次的访问令牌"
+                assert oauth_account.access_token is None, \
+                    "不应持久化第一次访问令牌"
             finally:
                 db.close()
         
@@ -547,10 +556,10 @@ class TestOAuthAccountLinking:
                     OAuthAccount.provider == provider,
                     OAuthAccount.provider_user_id == oauth_user_id
                 ).first()
-                assert oauth_account.access_token == access_token2, \
-                    "OAuth访问令牌应该被更新为新令牌"
-                assert oauth_account.refresh_token == f"refresh_{access_token2}", \
-                    "OAuth刷新令牌应该被更新"
+                assert oauth_account.access_token is None, \
+                    "不应持久化OAuth访问令牌"
+                assert oauth_account.refresh_token is None, \
+                    "不应持久化OAuth刷新令牌"
                 
             finally:
                 db.close()
