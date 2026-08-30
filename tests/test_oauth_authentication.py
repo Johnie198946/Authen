@@ -446,8 +446,11 @@ class TestOAuthAuthentication:
         assert new_user.username.startswith("testuser_")
         db.close()
     
-    def test_oauth_get_authorization_url(self):
+    def test_oauth_get_authorization_url(self, monkeypatch):
         """测试获取OAuth授权URL"""
+        monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-client")
+        monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-secret")
+        monkeypatch.setenv("OAUTH_ALLOWED_REDIRECT_URIS", "http://localhost:3000/callback")
         response = client.get(
             "/api/v1/auth/oauth/google/authorize",
             params={
@@ -464,8 +467,11 @@ class TestOAuthAuthentication:
         assert "accounts.google.com" in data["authorization_url"]
         assert data["state"] == "random_state_123"
     
-    def test_oauth_get_authorization_url_without_state(self):
+    def test_oauth_get_authorization_url_without_state(self, monkeypatch):
         """测试获取OAuth授权URL（不提供state）"""
+        monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-client")
+        monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-secret")
+        monkeypatch.setenv("OAUTH_ALLOWED_REDIRECT_URIS", "http://localhost:3000/callback")
         response = client.get(
             "/api/v1/auth/oauth/google/authorize",
             params={

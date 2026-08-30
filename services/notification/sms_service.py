@@ -330,7 +330,9 @@ class SMSService:
         }
         if not all(
             config[key]
-            for key in ("access_key_id", "access_key_secret", "sign_name")
+            for key in (
+                "access_key_id", "access_key_secret", "sign_name", "template_code"
+            )
         ):
             logger.error("阿里云短信环境变量配置不完整")
             return None

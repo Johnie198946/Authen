@@ -3,6 +3,7 @@
 """
 import sys
 import os
+import asyncio
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -25,6 +26,11 @@ from shared.redis_client import get_redis
 from shared.config import settings
 from shared.middleware.api_logger import APILoggerMiddleware
 from shared.utils.health_check import check_overall_health
+from shared.oauth_settings import (
+    allow_debug_verification_codes,
+    get_provider_config,
+    validate_redirect_uri,
+)
 
 app = FastAPI(
     title="认证服务",
@@ -626,6 +632,28 @@ async def logout():
     return {"success": True, "message": "登出成功"}
 
 
+@app.get("/api/v1/auth/capabilities")
+async def auth_capabilities():
+    """Return provider readiness without exposing credentials."""
+    from services.notification.sms_service import SMSService
+
+    sms_ready = SMSService().sms_client is not None
+    oauth = {}
+    for provider in ("wechat", "alipay"):
+        configured = get_provider_config(provider).is_configured
+        oauth[provider] = {
+            "enabled": configured,
+            "reason": "configured" if configured else "credentials_missing",
+        }
+    return {
+        "phone": {
+            "enabled": sms_ready,
+            "reason": "configured" if sms_ready else "provider_not_configured",
+        },
+        "oauth": oauth,
+    }
+
+
 @app.post("/api/v1/auth/send-sms")
 async def send_sms_code(request: SendSMSRequest):
     """
@@ -652,9 +680,22 @@ async def send_sms_code(request: SendSMSRequest):
             detail="发送过于频繁，请60秒后重试"
         )
     
-    # 生成6位验证码
+    # 生成6位验证码；只有真实发送成功后才写入 Redis，避免产生用户
+    # 永远收不到、但服务端却接受的幽灵验证码。
     verification_code = ''.join([str(secrets.randbelow(10)) for _ in range(6)])
-    
+    from services.notification.sms_service import SMSService
+    sent = await asyncio.to_thread(
+        SMSService().send_verification_sms,
+        request.phone,
+        verification_code,
+    )
+    debug_code_allowed = bool(settings.DEBUG and allow_debug_verification_codes())
+    if not sent and not debug_code_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="短信发送失败，请稍后重试",
+        )
+
     # 存储到Redis，5分钟过期
     redis.setex(
         f"sms_code:{request.phone}",
@@ -665,12 +706,10 @@ async def send_sms_code(request: SendSMSRequest):
     # 设置频率限制
     set_rate_limit(redis, "sms", request.phone)
     
-    # TODO: 调用通知服务发送短信
-    # 开发环境下直接返回验证码（生产环境应该删除）
     return {
         "success": True,
         "message": "验证码已发送",
-        "code": verification_code if settings.DEBUG else None
+        "code": verification_code if debug_code_allowed else None
     }
 
 
@@ -998,40 +1037,27 @@ async def oauth_authenticate(
             detail=f"不支持的OAuth提供商: {provider}"
         )
     
-    # 从环境变量获取OAuth配置
-    oauth_config = {
-        "wechat": {
-            "client_id": settings.WECHAT_APP_ID,
-            "client_secret": settings.WECHAT_APP_SECRET,
-        },
-        "alipay": {
-            "client_id": settings.ALIPAY_APP_ID,
-            "client_secret": settings.ALIPAY_APP_SECRET,
-        },
-        "google": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        },
-        "apple": {
-            "client_id": settings.APPLE_CLIENT_ID,
-            "client_secret": settings.APPLE_CLIENT_SECRET,
-        }
-    }
-    
-    config = oauth_config.get(provider, {})
-    if not config.get("client_id") or not config.get("client_secret"):
+    config = get_provider_config(provider)
+    if not config.is_configured:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{provider} OAuth配置未设置"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{provider} OAuth尚未配置",
+        )
+    if not validate_redirect_uri(request.redirect_uri, debug=settings.DEBUG):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="OAuth redirect_uri 未获准",
         )
     
     try:
         # 创建OAuth客户端
         oauth_client = get_oauth_client(
             provider=provider,
-            client_id=config["client_id"],
-            client_secret=config["client_secret"],
-            redirect_uri=request.redirect_uri
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            redirect_uri=request.redirect_uri,
+            provider_public_key=config.provider_public_key,
+            mode=config.mode,
         )
         
         # 用授权码交换访问令牌
@@ -1067,14 +1093,12 @@ async def oauth_authenticate(
         is_new_user = False
         
         if oauth_account:
-            # 已存在OAuth账号，更新令牌
+            # Provider tokens are transient authentication material. Never persist
+            # them after resolving the provider identity.
             user = oauth_account.user
-            oauth_account.access_token = token_data["access_token"]
-            oauth_account.refresh_token = token_data.get("refresh_token")
-            if token_data.get("expires_in"):
-                oauth_account.token_expires_at = datetime.utcnow() + timedelta(
-                    seconds=token_data["expires_in"]
-                )
+            oauth_account.access_token = None
+            oauth_account.refresh_token = None
+            oauth_account.token_expires_at = None
             oauth_account.updated_at = datetime.utcnow()
             db.commit()
         else:
@@ -1111,11 +1135,9 @@ async def oauth_authenticate(
                 user_id=user.id,
                 provider=provider,
                 provider_user_id=provider_user_id,
-                access_token=token_data["access_token"],
-                refresh_token=token_data.get("refresh_token"),
-                token_expires_at=datetime.utcnow() + timedelta(
-                    seconds=token_data.get("expires_in", 3600)
-                ) if token_data.get("expires_in") else None
+                access_token=None,
+                refresh_token=None,
+                token_expires_at=None,
             )
             db.add(oauth_account)
             db.commit()
@@ -1182,40 +1204,27 @@ async def oauth_authorize(provider: str, redirect_uri: str, state: str = None):
             detail=f"不支持的OAuth提供商: {provider}"
         )
     
-    # 从环境变量获取OAuth配置
-    oauth_config = {
-        "wechat": {
-            "client_id": settings.WECHAT_APP_ID,
-            "client_secret": settings.WECHAT_APP_SECRET,
-        },
-        "alipay": {
-            "client_id": settings.ALIPAY_APP_ID,
-            "client_secret": settings.ALIPAY_APP_SECRET,
-        },
-        "google": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        },
-        "apple": {
-            "client_id": settings.APPLE_CLIENT_ID,
-            "client_secret": settings.APPLE_CLIENT_SECRET,
-        }
-    }
-    
-    config = oauth_config.get(provider, {})
-    if not config.get("client_id") or not config.get("client_secret"):
+    config = get_provider_config(provider)
+    if not config.is_configured:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{provider} OAuth配置未设置"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"{provider} OAuth尚未配置",
+        )
+    if not validate_redirect_uri(redirect_uri, debug=settings.DEBUG):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="OAuth redirect_uri 未获准",
         )
     
     try:
         # 创建OAuth客户端
         oauth_client = get_oauth_client(
             provider=provider,
-            client_id=config["client_id"],
-            client_secret=config["client_secret"],
-            redirect_uri=redirect_uri
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            redirect_uri=redirect_uri,
+            provider_public_key=config.provider_public_key,
+            mode=config.mode,
         )
         
         # 生成state（如果未提供）
