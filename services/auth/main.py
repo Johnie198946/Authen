@@ -18,7 +18,7 @@ import uuid
 from shared.database import get_db
 from shared.models.user import User
 from shared.utils.crypto import hash_password, verify_password
-from shared.utils.jwt import create_access_token, create_refresh_token
+from shared.utils.jwt import create_access_token, create_refresh_token, human_principal_claims
 from shared.utils.validators import validate_password, validate_username
 from shared.utils.sso_session import create_sso_session
 from shared.redis_client import get_redis
@@ -428,12 +428,16 @@ async def login(
     token_data = {
         "sub": str(user.id),
         "username": user.username,
-        "email": user.email
+        "email": user.email,
+        **human_principal_claims("pwd"),
     }
-    
+
     access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token({"sub": str(user.id)})
-    
+    refresh_token = create_refresh_token({
+        "sub": str(user.id),
+        **{key: token_data[key] for key in ("principal_type", "amr", "auth_time")},
+    })
+
     return LoginResponse(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -587,9 +591,17 @@ async def refresh_token(request: RefreshTokenRequest):
             detail="Refresh Token无效或已过期"
         )
     
-    # 生成新的Access Token
+    # 生成新的Access Token。旧 refresh token 没有可审计的交互式身份声明，必须重新登录。
+    if payload.get("principal_type") != "human" or not payload.get("amr") or not payload.get("auth_time"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh Token缺少交互式身份声明，请重新登录"
+        )
     token_data = {
-        "sub": payload["sub"]
+        "sub": payload["sub"],
+        "principal_type": payload["principal_type"],
+        "amr": payload["amr"],
+        "auth_time": payload["auth_time"],
     }
     access_token = create_access_token(token_data)
     
@@ -767,11 +779,15 @@ async def login_with_phone_code(
     token_data = {
         "sub": str(user.id),
         "username": user.username,
-        "email": user.email
+        "email": user.email,
+        **human_principal_claims("otp"),
     }
 
     access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    refresh_token = create_refresh_token({
+        "sub": str(user.id),
+        **{key: token_data[key] for key in ("principal_type", "amr", "auth_time")},
+    })
 
     return LoginResponse(
         access_token=access_token,
@@ -846,11 +862,15 @@ async def login_with_email_code(
     token_data = {
         "sub": str(user.id),
         "username": user.username,
-        "email": user.email
+        "email": user.email,
+        **human_principal_claims("otp"),
     }
 
     access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token({"sub": str(user.id)})
+    refresh_token = create_refresh_token({
+        "sub": str(user.id),
+        **{key: token_data[key] for key in ("principal_type", "amr", "auth_time")},
+    })
 
     return LoginResponse(
         access_token=access_token,
@@ -1108,11 +1128,15 @@ async def oauth_authenticate(
         token_payload = {
             "sub": str(user.id),
             "username": user.username,
-            "email": user.email
+            "email": user.email,
+            **human_principal_claims("oauth"),
         }
-        
+
         access_token = create_access_token(token_payload)
-        refresh_token = create_refresh_token({"sub": str(user.id)})
+        refresh_token = create_refresh_token({
+            "sub": str(user.id),
+            **{key: token_payload[key] for key in ("principal_type", "amr", "auth_time")},
+        })
         
         return OAuthResponse(
             access_token=access_token,

@@ -1,10 +1,27 @@
 """
 JWT Token工具模块
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from jose import JWTError, jwt
 from shared.config import settings
+
+
+INTERACTIVE_HUMAN_AUTH_METHODS = {
+    "pwd", "mfa", "passkey", "sms", "otp", "oidc", "oauth", "test_interactive"
+}
+
+
+def human_principal_claims(auth_method: str) -> Dict:
+    """Return explicit, auditable claims for an interactive human login."""
+    normalized_method = str(auth_method or "").strip().lower()
+    if normalized_method not in INTERACTIVE_HUMAN_AUTH_METHODS:
+        raise ValueError("unsupported interactive human authentication method")
+    return {
+        "principal_type": "human",
+        "amr": [normalized_method],
+        "auth_time": int(datetime.now(timezone.utc).timestamp()),
+    }
 
 
 def create_access_token(data: Dict, expires_delta: Optional[timedelta] = None) -> str:

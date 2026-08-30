@@ -9,9 +9,14 @@ Feature: unified-auth-platform, Property 4: 登录Token生成
 验证需求：1.4
 """
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hypothesis import given, strategies as st
-from shared.utils.jwt import create_access_token, create_refresh_token, decode_token
+from shared.utils.jwt import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    human_principal_claims,
+)
 from shared.config import settings
 
 
@@ -143,6 +148,26 @@ def test_token_generation_integrity(user_id, username, email, user_roles, user_p
         "Access Token签发时间应该是当前时间"
     assert abs((refresh_iat - now).total_seconds()) < 60, \
         "Refresh Token签发时间应该是当前时间"
+
+
+def test_human_principal_claims_are_explicit_and_reject_unknown_methods():
+    before = int(datetime.now(timezone.utc).timestamp())
+    claims = human_principal_claims("pwd")
+    after = int(datetime.now(timezone.utc).timestamp())
+
+    assert claims["principal_type"] == "human"
+    assert claims["amr"] == ["pwd"]
+    assert before <= claims["auth_time"] <= after
+
+    token = create_access_token({"sub": "human-user", **claims})
+    decoded = decode_token(token)
+    assert decoded is not None
+    assert decoded["principal_type"] == "human"
+    assert decoded["amr"] == ["pwd"]
+    assert decoded["auth_time"] == claims["auth_time"]
+
+    with pytest.raises(ValueError, match="unsupported interactive human"):
+        human_principal_claims("service_token")
 
 
 def test_token_generation_with_specific_examples():

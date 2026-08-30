@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 import secrets
 from shared.database import get_db
 from shared.models.user import User, SSOSession
-from shared.utils.jwt import create_access_token, create_id_token, decode_token
+from shared.utils.jwt import create_access_token, create_id_token, decode_token, human_principal_claims
 from shared.utils.sso_session import (
     get_sso_session,
     validate_sso_session,
@@ -111,7 +111,8 @@ async def token(request: TokenRequest, db: Session = Depends(get_db)):
         "sub": str(user.id),
         "username": user.username,
         "email": user.email,
-        "client_id": request.client_id
+        "client_id": request.client_id,
+        **human_principal_claims("oidc"),
     }
     access_token = create_access_token(token_data)
     
