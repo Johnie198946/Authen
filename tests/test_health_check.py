@@ -50,8 +50,8 @@ def test_check_database_health_success():
     - 包含响应时间
     - 包含数据库详情
     """
-    result = check_database_health()
-    
+    with patch('shared.database.engine', engine):
+        result = check_database_health()
     assert result["status"] == "healthy"
     assert result["message"] == "数据库连接正常"
     assert "response_time" in result

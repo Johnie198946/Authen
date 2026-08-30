@@ -1,19 +1,22 @@
 """
-JWT Token工具模块
+JWT工具模块
 """
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
+import uuid
+
 from jose import JWTError, jwt
+
 from shared.config import settings
 
 
 INTERACTIVE_HUMAN_AUTH_METHODS = {
-    "pwd", "mfa", "passkey", "sms", "otp", "oidc", "oauth", "test_interactive"
+    "pwd", "mfa", "passkey", "sms", "otp", "oidc", "oauth"
 }
 
 
 def human_principal_claims(auth_method: str) -> Dict:
-    """Return explicit, auditable claims for an interactive human login."""
+    """Build auditable claims only for an interactive human authentication event."""
     normalized_method = str(auth_method or "").strip().lower()
     if normalized_method not in INTERACTIVE_HUMAN_AUTH_METHODS:
         raise ValueError("unsupported interactive human authentication method")
@@ -26,116 +29,129 @@ def human_principal_claims(auth_method: str) -> Dict:
 
 def create_access_token(data: Dict, expires_delta: Optional[timedelta] = None) -> str:
     """
-    创建Access Token
-    
+    创建访问令牌
+
     Args:
-        data: Token载荷数据
+        data: 要编码的数据
         expires_delta: 过期时间增量
-        
+
     Returns:
-        JWT Token字符串
+        str: JWT令牌
     """
     to_encode = data.copy()
-    
+
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    # 这些注册声明必须由发行方生成，不能由调用方覆盖。
     to_encode.update({
         "exp": expire,
-        "iat": datetime.utcnow(),
-        "iss": settings.APP_NAME
+        "iat": datetime.now(timezone.utc),
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_ACCESS_AUDIENCE,
+        "token_use": "access",
+        "jti": str(uuid.uuid4()),
     })
-    
-    encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
-    return encoded_jwt
+
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(data: Dict) -> str:
+def create_refresh_token(data: Dict, expires_delta: Optional[timedelta] = None) -> str:
     """
-    创建Refresh Token
-    
+    创建刷新令牌
+
     Args:
-        data: Token载荷数据
-        
+        data: 要编码的数据
+        expires_delta: 过期时间增量
+
     Returns:
-        JWT Token字符串
+        str: JWT令牌
     """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    to_encode.update({
-        "exp": expire,
-        "iat": datetime.utcnow(),
-        "iss": settings.APP_NAME
-    })
-    
-    encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
-    return encoded_jwt
 
-
-def create_id_token(user_data: Dict, client_id: str, expires_delta: Optional[timedelta] = None) -> str:
-    """
-    创建OpenID Connect ID Token
-    
-    Args:
-        user_data: 用户信息数据（包含sub, email, username等）
-        client_id: 客户端应用ID
-        expires_delta: 过期时间增量
-        
-    Returns:
-        JWT ID Token字符串
-    """
-    to_encode = user_data.copy()
-    
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+        expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
     to_encode.update({
         "exp": expire,
-        "iat": datetime.utcnow(),
-        "iss": settings.APP_NAME,
-        "aud": client_id  # OpenID Connect要求ID Token包含audience
+        "iat": datetime.now(timezone.utc),
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_REFRESH_AUDIENCE,
+        "token_use": "refresh",
+        "jti": str(uuid.uuid4()),
     })
-    
-    encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
-    return encoded_jwt
+
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def decode_token(token: str, audience: Optional[str] = None) -> Optional[Dict]:
+def create_id_token(data: Dict, client_id: str, expires_delta: Optional[timedelta] = None) -> str:
     """
-    解码并验证Token
-    
+    创建OpenID Connect ID令牌
+
     Args:
-        token: JWT Token字符串
-        audience: 可选的audience验证（用于ID Token）
-        
+        data: 要编码的用户数据
+        client_id: 客户端ID
+        expires_delta: 过期时间增量
+
     Returns:
-        Token载荷数据，验证失败返回None
+        str: ID令牌
+    """
+    to_encode = data.copy()
+
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "iss": settings.JWT_ISSUER,
+        "aud": client_id,
+        "token_use": "id",
+        "jti": str(uuid.uuid4()),
+    })
+
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_token(
+    token: str,
+    audience: Optional[str] = None,
+    token_use: Optional[str] = None,
+) -> Optional[Dict]:
+    """
+    解码和验证JWT令牌。可选地强制 audience 和 token_use。
+
+    Args:
+        token: JWT令牌
+        audience: 预期的受众
+        token_use: 预期用途（access/refresh/id）
+
+    Returns:
+        Optional[Dict]: 解码后的数据，验证失败返回None
     """
     try:
-        options = {"verify_aud": False}  # 默认不验证audience，因为不是所有token都有aud
-        if audience:
-            options = {"verify_aud": True}
-            payload = jwt.decode(
-                token, 
-                settings.JWT_SECRET_KEY, 
-                algorithms=[settings.JWT_ALGORITHM],
-                audience=audience,
-                options=options
-            )
-        else:
-            payload = jwt.decode(
-                token, 
-                settings.JWT_SECRET_KEY, 
-                algorithms=[settings.JWT_ALGORITHM],
-                options=options
-            )
+        options = {"verify_aud": audience is not None}
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            audience=audience,
+            issuer=settings.JWT_ISSUER,
+            options=options,
+        )
+        if token_use and payload.get("token_use") != token_use:
+            return None
         return payload
-    except JWTError as e:
-        # 可以记录错误日志用于调试
-        # print(f"JWT decode error: {e}")
+    except JWTError:
         return None
+
+
+def verify_token(token: str, audience: Optional[str] = None, token_use: Optional[str] = None) -> bool:
+    """验证JWT令牌是否有效。"""
+    return decode_token(token, audience, token_use) is not None

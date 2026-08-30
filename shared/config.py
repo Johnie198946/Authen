@@ -23,11 +23,17 @@ class Settings(BaseSettings):
     # JWT配置
     JWT_SECRET_KEY: str = "your-secret-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"  # 使用HS256而不是RS256以简化开发
+    JWT_ISSUER: str = "Unified Auth Platform"
+    JWT_ACCESS_AUDIENCE: str = "ai-lab-platform"
+    JWT_REFRESH_AUDIENCE: str = "authen-refresh"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14
     
     # SSO会话配置
     SSO_SESSION_EXPIRE_HOURS: int = 24  # SSO会话过期时间（小时）
+    # JSON: {"client_id":{"client_secret":"...","redirect_uris":["https://..."]}}
+    # 空映射时授权码流程关闭（fail closed）。
+    SSO_CLIENTS_JSON: str = "{}"
     
     # 应用配置
     APP_NAME: str = "Unified Auth Platform"

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+import json
 import secrets
 from shared.database import get_db
 from shared.models.user import User, SSOSession
@@ -47,9 +48,28 @@ class TokenResponse(BaseModel):
     token_type: str = "Bearer"
     expires_in: int
 
+
+def _registered_sso_client(client_id: str, redirect_uri: str) -> dict:
+    """Return an explicitly configured client and require an exact redirect URI."""
+    try:
+        clients = json.loads(settings.SSO_CLIENTS_JSON or "{}")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="SSO客户端配置无效")
+    client = clients.get(client_id) if isinstance(clients, dict) else None
+    if not isinstance(client, dict):
+        raise HTTPException(status_code=400, detail="未注册的SSO客户端")
+    allowed_redirects = client.get("redirect_uris") or []
+    if redirect_uri not in allowed_redirects:
+        raise HTTPException(status_code=400, detail="redirect_uri未注册")
+    return client
+
 @app.get("/")
 async def root():
     return {"service": "SSO服务", "status": "running"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "sso"}
 
 @app.get("/api/v1/sso/authorize")
 async def authorize(
@@ -58,23 +78,31 @@ async def authorize(
     response_type: str = Query(...),
     scope: str = Query(default="openid profile email"),
     state: str = Query(default=None),
-    user_id: str = Query(default=None),  # 在实际场景中，这应该从会话中获取
+    session_token: str = Header(..., alias="X-SSO-Session"),
     db: Session = Depends(get_db)
 ):
     """OAuth 2.0授权端点"""
     if response_type != "code":
         raise HTTPException(status_code=400, detail="不支持的response_type")
     
-    # 在实际场景中，应该验证用户是否已登录
-    # 这里为了测试，允许传入user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="用户未登录")
+    _registered_sso_client(client_id, redirect_uri)
+    is_valid, error_msg, session = validate_sso_session(session_token, db)
+    if not is_valid or session is None:
+        raise HTTPException(status_code=401, detail=error_msg or "用户未登录")
     
     # 生成授权码
     auth_code = secrets.token_urlsafe(32)
     redis = get_redis()
-    # 存储授权码，包含client_id、redirect_uri和user_id
-    redis.setex(f"auth_code:{auth_code}", 600, f"{client_id}:{redirect_uri}:{user_id}")
+    # JSON 避免 redirect_uri 中的冒号造成解析歧义；短 TTL 且只能交换一次。
+    redis.setex(
+        f"auth_code:{auth_code}",
+        120,
+        json.dumps({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "user_id": str(session.user_id),
+        }, separators=(",", ":")),
+    )
     
     return {"authorization_code": auth_code, "state": state}
 
@@ -84,22 +112,28 @@ async def token(request: TokenRequest, db: Session = Depends(get_db)):
     if request.grant_type != "authorization_code":
         raise HTTPException(status_code=400, detail="不支持的grant_type")
     
+    client = _registered_sso_client(request.client_id, request.redirect_uri)
+    expected_secret = str(client.get("client_secret") or "")
+    if not expected_secret or not secrets.compare_digest(request.client_secret, expected_secret):
+        raise HTTPException(status_code=401, detail="客户端认证失败")
+
     redis = get_redis()
-    stored_data = redis.get(f"auth_code:{request.code}")
+    key = f"auth_code:{request.code}"
+    # Redis >= 6.2 GETDEL 保证授权码不会被并发重放。
+    stored_data = redis.getdel(key)
     if not stored_data:
         raise HTTPException(status_code=400, detail="无效的授权码")
     
-    # 解析存储的数据
-    parts = stored_data.split(':')
-    if len(parts) != 3:
+    try:
+        stored = json.loads(stored_data)
+    except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="授权码数据格式错误")
-    
-    stored_client_id, stored_redirect_uri, user_id = parts
-    if stored_client_id != request.client_id or stored_redirect_uri != request.redirect_uri:
+
+    if stored.get("client_id") != request.client_id or stored.get("redirect_uri") != request.redirect_uri:
         raise HTTPException(status_code=400, detail="客户端信息不匹配")
-    
-    # 删除授权码（一次性使用）
-    redis.delete(f"auth_code:{request.code}")
+    user_id = stored.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="授权码数据格式错误")
     
     # 从数据库获取用户信息
     user = db.query(User).filter(User.id == user_id).first()
@@ -139,7 +173,11 @@ async def userinfo(authorization: str = Header(None), db: Session = Depends(get_
         raise HTTPException(status_code=401, detail="未授权")
     
     token = authorization.split(" ")[1]
-    payload = decode_token(token)
+    payload = decode_token(
+        token,
+        audience=settings.JWT_ACCESS_AUDIENCE,
+        token_use="access",
+    )
     if not payload:
         raise HTTPException(status_code=401, detail="Token无效")
     

@@ -244,6 +244,10 @@ class PermissionResponse(BaseModel):
 async def root():
     return {"service": "权限服务", "status": "running"}
 
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "permission"}
+
 @app.get("/api/v1/roles", response_model=List[RoleResponse])
 async def list_roles(db: Session = Depends(get_db)):
     """获取角色列表"""

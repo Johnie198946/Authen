@@ -583,8 +583,12 @@ async def refresh_token(request: RefreshTokenRequest):
     """
     from shared.utils.jwt import decode_token
     
-    # 验证Refresh Token
-    payload = decode_token(request.refresh_token)
+    # 只能用 refresh 用途且受众为 Authen 的令牌刷新；access/id token 必须拒绝。
+    payload = decode_token(
+        request.refresh_token,
+        audience=settings.JWT_REFRESH_AUDIENCE,
+        token_use="refresh",
+    )
     if not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

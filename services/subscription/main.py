@@ -405,6 +405,10 @@ async def _push_entitlement_changed(sub_id: str) -> None:
 async def root():
     return {"service": "订阅服务", "status": "running"}
 
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "subscription"}
+
 
 @app.post("/api/v1/internal/knowledge-pack-approvals")
 async def approve_knowledge_pack_content(

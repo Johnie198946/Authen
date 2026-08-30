@@ -521,7 +521,11 @@ def _extract_user_id_from_token(request: Request) -> Optional[str]:
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.split(" ", 1)[1]
-        payload = decode_token(token)
+        payload = decode_token(
+            token,
+            audience=settings.JWT_ACCESS_AUDIENCE,
+            token_use="access",
+        )
         if payload and "sub" in payload:
             return payload["sub"]
     return None

@@ -73,6 +73,10 @@ class AdminCreateResponse(BaseModel):
 async def root():
     return {"service": "用户服务", "status": "running"}
 
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "user"}
+
 @app.get("/api/v1/users", response_model=UserListResponse)
 async def list_users(
     page: int = Query(1, ge=1),

@@ -58,9 +58,10 @@ permissions = st.lists(
     username=usernames,
     email=emails,
     user_roles=roles,
-    user_permissions=permissions
+    user_permissions=permissions,
+    token_id=st.uuids(),
 )
-def test_token_generation_integrity(user_id, username, email, user_roles, user_permissions):
+def test_token_generation_integrity(user_id, username, email, user_roles, user_permissions, token_id):
     """
     属性 4：登录Token生成
     
@@ -85,7 +86,7 @@ def test_token_generation_integrity(user_id, username, email, user_roles, user_p
     # 生成Refresh Token
     refresh_token_data = {
         "sub": user_id,
-        "token_id": str(st.uuids().example())
+        "token_id": str(token_id)
     }
     refresh_token = create_refresh_token(refresh_token_data)
     
@@ -126,9 +127,9 @@ def test_token_generation_integrity(user_id, username, email, user_roles, user_p
     assert decoded_refresh["iss"] == settings.APP_NAME, "Refresh Token签发者应该正确"
     
     # 属性7：过期时间应该在合理范围内
-    now = datetime.utcnow()
-    access_exp = datetime.fromtimestamp(decoded_access["exp"])
-    refresh_exp = datetime.fromtimestamp(decoded_refresh["exp"])
+    now = datetime.now(timezone.utc)
+    access_exp = datetime.fromtimestamp(decoded_access["exp"], tz=timezone.utc)
+    refresh_exp = datetime.fromtimestamp(decoded_refresh["exp"], tz=timezone.utc)
     
     # Access Token应该在15分钟后过期（允许1分钟误差）
     expected_access_exp = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -141,8 +142,8 @@ def test_token_generation_integrity(user_id, username, email, user_roles, user_p
         "Refresh Token过期时间应该在14天左右"
     
     # 属性8：签发时间应该是当前时间（允许1分钟误差）
-    access_iat = datetime.fromtimestamp(decoded_access["iat"])
-    refresh_iat = datetime.fromtimestamp(decoded_refresh["iat"])
+    access_iat = datetime.fromtimestamp(decoded_access["iat"], tz=timezone.utc)
+    refresh_iat = datetime.fromtimestamp(decoded_refresh["iat"], tz=timezone.utc)
     
     assert abs((access_iat - now).total_seconds()) < 60, \
         "Access Token签发时间应该是当前时间"
@@ -231,8 +232,8 @@ def test_token_with_custom_expiration():
     assert decoded is not None, "应该能解码自定义过期时间的Token"
     
     # 验证过期时间
-    now = datetime.utcnow()
-    exp = datetime.fromtimestamp(decoded["exp"])
+    now = datetime.now(timezone.utc)
+    exp = datetime.fromtimestamp(decoded["exp"], tz=timezone.utc)
     expected_exp = now + custom_expires
     
     assert abs((exp - expected_exp).total_seconds()) < 60, \
@@ -317,8 +318,8 @@ def test_token_with_minimal_data():
     assert decoded_refresh["sub"] == "test-user-id"
 
 
-@given(user_id=user_ids)
-def test_refresh_token_minimal_payload(user_id):
+@given(user_id=user_ids, token_id=st.uuids())
+def test_refresh_token_minimal_payload(user_id, token_id):
     """
     测试Refresh Token的最小载荷
     
@@ -327,7 +328,7 @@ def test_refresh_token_minimal_payload(user_id):
     """
     refresh_data = {
         "sub": user_id,
-        "token_id": str(st.uuids().example())
+        "token_id": str(token_id)
     }
     
     refresh_token = create_refresh_token(refresh_data)

@@ -426,7 +426,11 @@ def _inject_app_id_into_tokens(body: dict, app_id: str) -> dict:
     解码原始 Token payload，注入 app_id 字段后重新签发。
     """
     if "access_token" in body:
-        payload = decode_token(body["access_token"])
+        payload = decode_token(
+            body["access_token"],
+            audience=settings.JWT_ACCESS_AUDIENCE,
+            token_use="access",
+        )
         if payload:
             # 移除 JWT 标准字段，保留业务字段
             new_payload = {k: v for k, v in payload.items() if k not in ("exp", "iat", "iss")}
@@ -434,7 +438,11 @@ def _inject_app_id_into_tokens(body: dict, app_id: str) -> dict:
             body["access_token"] = create_access_token(new_payload)
 
     if "refresh_token" in body:
-        payload = decode_token(body["refresh_token"])
+        payload = decode_token(
+            body["refresh_token"],
+            audience=settings.JWT_REFRESH_AUDIENCE,
+            token_use="refresh",
+        )
         if payload:
             new_payload = {k: v for k, v in payload.items() if k not in ("exp", "iat", "iss")}
             new_payload["app_id"] = app_id
