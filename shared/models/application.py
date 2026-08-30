@@ -44,7 +44,7 @@ class Application(Base):
     scopes = relationship("AppScope", back_populates="application", cascade="all, delete-orphan")
     app_users = relationship("AppUser", back_populates="application", cascade="all, delete-orphan")
     app_organizations = relationship("AppOrganization", back_populates="application", cascade="all, delete-orphan")
-    app_subscription_plan = relationship("AppSubscriptionPlan", back_populates="application", cascade="all, delete-orphan", uselist=False)
+    app_subscription_plans = relationship("AppSubscriptionPlan", back_populates="application", cascade="all, delete-orphan")
     auto_provision_config = relationship("AutoProvisionConfig", back_populates="application", cascade="all, delete-orphan", uselist=False)
 
 
@@ -128,10 +128,10 @@ class AppSubscriptionPlan(Base):
     plan_id = Column(UUID(as_uuid=True), ForeignKey('subscription_plans.id', ondelete='CASCADE'), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    application = relationship("Application", back_populates="app_subscription_plan")
+    application = relationship("Application", back_populates="app_subscription_plans")
 
     __table_args__ = (
-        UniqueConstraint('application_id', name='uq_app_subscription_plan'),
+        UniqueConstraint('application_id', 'plan_id', name='uq_app_subscription_plan'),
     )
 
 

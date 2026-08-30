@@ -9,11 +9,10 @@ import logging
 import json
 import hmac
 import hashlib
+import os
 import time
-import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional
-from urllib.parse import urlencode
 import httpx
 from jinja2 import Template, TemplateError
 from sqlalchemy.orm import Session
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 class AliyunSMSClient:
     """阿里云短信客户端"""
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], sdk_client=None, request_factory=None):
         """
         初始化阿里云短信客户端
         
@@ -36,60 +35,56 @@ class AliyunSMSClient:
                 - access_key_secret: AccessKey Secret
                 - sign_name: 短信签名
                 - endpoint: API端点（默认：dysmsapi.aliyuncs.com）
+                - region_id: 地域（默认：cn-qingdao）
         """
         self.access_key_id = config.get('access_key_id')
         self.access_key_secret = config.get('access_key_secret')
         self.sign_name = config.get('sign_name')
         self.endpoint = config.get('endpoint', 'dysmsapi.aliyuncs.com')
+        self.region_id = config.get('region_id', 'cn-qingdao')
         
         if not all([self.access_key_id, self.access_key_secret, self.sign_name]):
             raise ValueError("阿里云短信配置不完整")
-    
-    def _generate_signature(self, params: Dict[str, str]) -> str:
-        """
-        生成阿里云API签名
-        
-        Args:
-            params: 请求参数
-            
-        Returns:
-            签名字符串
-        """
-        # 按字典序排序参数
-        sorted_params = sorted(params.items())
-        
-        # 构造待签名字符串
-        canonicalized_query_string = '&'.join([
-            f"{self._percent_encode(k)}={self._percent_encode(v)}"
-            for k, v in sorted_params
-        ])
-        
-        string_to_sign = f"GET&%2F&{self._percent_encode(canonicalized_query_string)}"
-        
-        # 计算HMAC-SHA1签名
-        h = hmac.new(
-            (self.access_key_secret + '&').encode('utf-8'),
-            string_to_sign.encode('utf-8'),
-            hashlib.sha1
+        self.sdk_client = sdk_client or self._create_sdk_client()
+        self.request_factory = request_factory or self._load_request_factory()
+
+    def _create_sdk_client(self):
+        """使用阿里云 V2 SDK 创建线程安全的 SendSms 客户端。"""
+        from alibabacloud_dysmsapi20170525.client import (
+            Client as Dysmsapi20170525Client,
         )
-        
-        import base64
-        signature = base64.b64encode(h.digest()).decode('utf-8')
-        
-        return signature
-    
-    def _percent_encode(self, s: str) -> str:
-        """
-        URL编码（符合阿里云规范）
-        
-        Args:
-            s: 待编码字符串
-            
-        Returns:
-            编码后的字符串
-        """
-        from urllib.parse import quote
-        return quote(str(s), safe='')
+        from alibabacloud_tea_openapi import models as open_api_models
+
+        config = open_api_models.Config(
+            access_key_id=self.access_key_id,
+            access_key_secret=self.access_key_secret,
+            region_id=self.region_id,
+        )
+        config.endpoint = self.endpoint
+        return Dysmsapi20170525Client(config)
+
+    @staticmethod
+    def _load_request_factory():
+        from alibabacloud_dysmsapi20170525 import (
+            models as dysmsapi_20170525_models,
+        )
+
+        return dysmsapi_20170525_models.SendSmsRequest
+
+    @staticmethod
+    def _domestic_phone(phone_number: str) -> str:
+        """国内 SendSms 模板使用 11 位大陆手机号。"""
+        compact = phone_number.strip().replace(" ", "").replace("-", "")
+        if compact.startswith("+86"):
+            compact = compact[3:]
+        elif compact.startswith("0086"):
+            compact = compact[4:]
+        return compact
+
+    @staticmethod
+    def _masked_phone(phone_number: str) -> str:
+        compact = AliyunSMSClient._domestic_phone(phone_number)
+        return f"*******{compact[-4:]}" if len(compact) >= 4 else "*******"
     
     def send_sms(
         self,
@@ -109,51 +104,31 @@ class AliyunSMSClient:
             发送是否成功
         """
         try:
-            # 构造请求参数
-            params = {
-                'SignatureMethod': 'HMAC-SHA1',
-                'SignatureNonce': str(uuid.uuid4()),
-                'AccessKeyId': self.access_key_id,
-                'SignatureVersion': '1.0',
-                'Timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'Format': 'JSON',
-                'Action': 'SendSms',
-                'Version': '2017-05-25',
-                'RegionId': 'cn-hangzhou',
-                'PhoneNumbers': phone_number,
-                'SignName': self.sign_name,
-                'TemplateCode': template_code,
-            }
-            
-            # 添加模板参数
-            if template_param:
-                params['TemplateParam'] = json.dumps(template_param)
-            
-            # 生成签名
-            signature = self._generate_signature(params)
-            params['Signature'] = signature
-            
-            # 发送请求
-            url = f"https://{self.endpoint}/"
-            
-            with httpx.Client(timeout=30.0) as client:
-                response = client.get(url, params=params)
-                response.raise_for_status()
-                
-                result = response.json()
-                
-                if result.get('Code') == 'OK':
-                    logger.info(f"阿里云短信发送成功: {phone_number}")
-                    return True
-                else:
-                    logger.error(f"阿里云短信发送失败: {result.get('Message')}")
-                    return False
-                    
-        except httpx.HTTPError as e:
-            logger.error(f"阿里云短信API请求失败: {e}")
+            request = self.request_factory(
+                phone_numbers=self._domestic_phone(phone_number),
+                sign_name=self.sign_name,
+                template_code=template_code,
+                template_param=json.dumps(template_param or {}, ensure_ascii=False),
+            )
+            response = self.sdk_client.send_sms(request)
+            body = response.body
+            response_code = getattr(body, "code", None)
+
+            if response_code == 'OK':
+                logger.info(
+                    "阿里云短信发送成功: %s",
+                    self._masked_phone(phone_number),
+                )
+                return True
+
+            logger.error(
+                "阿里云短信发送失败: code=%s request_id=%s",
+                response_code,
+                getattr(body, "request_id", None),
+            )
             return False
         except Exception as e:
-            logger.error(f"阿里云短信发送异常: {e}")
+            logger.error("阿里云短信发送异常: %s", type(e).__name__)
             return False
 
 
@@ -333,6 +308,46 @@ class SMSService:
         self.sms_config = None
         self.sms_client = None
         self.load_sms_config()
+
+    @staticmethod
+    def _environment_config() -> Optional[tuple[str, Dict[str, Any]]]:
+        """从部署环境加载短信配置，避免把 AccessKey 存入源码或数据库。"""
+        provider = os.getenv("SMS_PROVIDER", "").strip().lower()
+        if provider != "aliyun":
+            return None
+
+        config = {
+            "access_key_id": os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip(),
+            "access_key_secret": os.getenv(
+                "ALIBABA_CLOUD_ACCESS_KEY_SECRET", ""
+            ).strip(),
+            "sign_name": os.getenv("ALIYUN_SMS_SIGN_NAME", "").strip(),
+            "template_code": os.getenv("ALIYUN_SMS_TEMPLATE_CODE", "").strip(),
+            "region_id": os.getenv("ALIYUN_SMS_REGION_ID", "cn-qingdao").strip(),
+            "endpoint": os.getenv(
+                "ALIYUN_SMS_ENDPOINT", "dysmsapi.aliyuncs.com"
+            ).strip(),
+        }
+        if not all(
+            config[key]
+            for key in ("access_key_id", "access_key_secret", "sign_name")
+        ):
+            logger.error("阿里云短信环境变量配置不完整")
+            return None
+        return provider, config
+
+    def _configure_client(self, provider: str, config: Dict[str, Any]) -> bool:
+        self.sms_config = config
+        if provider == 'aliyun':
+            self.sms_client = AliyunSMSClient(config)
+            logger.info("成功加载阿里云短信配置")
+        elif provider == 'tencent':
+            self.sms_client = TencentSMSClient(config)
+            logger.info("成功加载腾讯云短信配置")
+        else:
+            logger.error("不支持的短信服务提供商: %s", provider)
+            return False
+        return True
     
     def load_sms_config(self) -> bool:
         """
@@ -351,29 +366,21 @@ class SMSService:
                 ).first()
                 
                 if config:
-                    self.sms_config = config.config
-                    provider = config.provider.lower()
-                    
-                    # 根据提供商创建客户端
-                    if provider == 'aliyun':
-                        self.sms_client = AliyunSMSClient(self.sms_config)
-                        logger.info("成功加载阿里云短信配置")
-                    elif provider == 'tencent':
-                        self.sms_client = TencentSMSClient(self.sms_config)
-                        logger.info("成功加载腾讯云短信配置")
-                    else:
-                        logger.error(f"不支持的短信服务提供商: {provider}")
-                        return False
-                    
-                    return True
-                else:
-                    logger.warning("未找到活跃的短信服务配置")
-                    return False
+                    return self._configure_client(
+                        config.provider.lower(), config.config
+                    )
             finally:
                 db.close()
         except Exception as e:
-            logger.error(f"加载短信配置失败: {e}")
-            return False
+            logger.warning("数据库短信配置不可用: %s", type(e).__name__)
+
+        environment_config = self._environment_config()
+        if environment_config:
+            provider, config = environment_config
+            return self._configure_client(provider, config)
+
+        logger.warning("未找到活跃的短信服务配置")
+        return False
     
     def get_template(self, template_name: str, db: Session) -> Optional[MessageTemplate]:
         """
@@ -473,6 +480,8 @@ class SMSService:
             # 根据不同的云服务提供商发送短信
             if isinstance(self.sms_client, AliyunSMSClient):
                 # 阿里云需要模板CODE
+                if not template_code and self.sms_config:
+                    template_code = self.sms_config.get('template_code')
                 if not template_code:
                     logger.error("阿里云短信需要模板CODE")
                     return False

@@ -5,6 +5,7 @@
 """
 import sys
 import os
+from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
@@ -19,6 +20,28 @@ from shared.models.system import CloudServiceConfig, MessageTemplate
 
 class TestAliyunSMSClient:
     """测试阿里云短信客户端"""
+
+    @staticmethod
+    def make_client(response_code='OK'):
+        sdk_client = Mock()
+        sdk_client.send_sms.return_value = SimpleNamespace(
+            body=SimpleNamespace(code=response_code, request_id='request-1')
+        )
+        request_factory = Mock(
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        config = {
+            'access_key_id': 'test_key_id',
+            'access_key_secret': 'test_key_secret',
+            'sign_name': '测试签名',
+            'region_id': 'cn-qingdao',
+        }
+        client = AliyunSMSClient(
+            config,
+            sdk_client=sdk_client,
+            request_factory=request_factory,
+        )
+        return client, sdk_client, request_factory
     
     def test_init_with_valid_config(self):
         """测试使用有效配置初始化"""
@@ -28,12 +51,15 @@ class TestAliyunSMSClient:
             'sign_name': '测试签名'
         }
         
-        client = AliyunSMSClient(config)
+        client = AliyunSMSClient(
+            config, sdk_client=Mock(), request_factory=Mock()
+        )
         
         assert client.access_key_id == 'test_key_id'
         assert client.access_key_secret == 'test_key_secret'
         assert client.sign_name == '测试签名'
         assert client.endpoint == 'dysmsapi.aliyuncs.com'
+        assert client.region_id == 'cn-qingdao'
     
     def test_init_with_invalid_config(self):
         """测试使用无效配置初始化"""
@@ -45,21 +71,9 @@ class TestAliyunSMSClient:
         with pytest.raises(ValueError, match="阿里云短信配置不完整"):
             AliyunSMSClient(config)
     
-    @patch('services.notification.sms_service.httpx.Client')
-    def test_send_sms_success(self, mock_client):
+    def test_send_sms_success(self):
         """测试成功发送短信"""
-        config = {
-            'access_key_id': 'test_key_id',
-            'access_key_secret': 'test_key_secret',
-            'sign_name': '测试签名'
-        }
-        
-        # Mock HTTP响应
-        mock_response = Mock()
-        mock_response.json.return_value = {'Code': 'OK'}
-        mock_client.return_value.__enter__.return_value.get.return_value = mock_response
-        
-        client = AliyunSMSClient(config)
+        client, sdk_client, request_factory = self.make_client()
         result = client.send_sms(
             phone_number='+8613800138000',
             template_code='SMS_123456789',
@@ -67,25 +81,16 @@ class TestAliyunSMSClient:
         )
         
         assert result is True
+        request = request_factory.call_args.kwargs
+        assert request['phone_numbers'] == '13800138000'
+        assert request['sign_name'] == '测试签名'
+        assert request['template_code'] == 'SMS_123456789'
+        assert request['template_param'] == '{"code": "123456"}'
+        sdk_client.send_sms.assert_called_once()
     
-    @patch('services.notification.sms_service.httpx.Client')
-    def test_send_sms_failure(self, mock_client):
+    def test_send_sms_failure(self):
         """测试发送短信失败"""
-        config = {
-            'access_key_id': 'test_key_id',
-            'access_key_secret': 'test_key_secret',
-            'sign_name': '测试签名'
-        }
-        
-        # Mock HTTP响应（失败）
-        mock_response = Mock()
-        mock_response.json.return_value = {
-            'Code': 'isv.BUSINESS_LIMIT_CONTROL',
-            'Message': '触发业务流控'
-        }
-        mock_client.return_value.__enter__.return_value.get.return_value = mock_response
-        
-        client = AliyunSMSClient(config)
+        client, _, _ = self.make_client('isv.BUSINESS_LIMIT_CONTROL')
         result = client.send_sms(
             phone_number='+8613800138000',
             template_code='SMS_123456789',
@@ -93,6 +98,9 @@ class TestAliyunSMSClient:
         )
         
         assert result is False
+
+    def test_masks_phone_for_logs(self):
+        assert AliyunSMSClient._masked_phone('+8613800138000') == '*******8000'
 
 
 class TestTencentSMSClient:
@@ -237,10 +245,34 @@ class TestSMSService:
         
         mock_db.query.return_value.filter.return_value.first.return_value = mock_config
         
-        service = SMSService()
+        with patch.object(AliyunSMSClient, '_create_sdk_client', return_value=Mock()), \
+             patch.object(AliyunSMSClient, '_load_request_factory', return_value=Mock()):
+            service = SMSService()
         
         assert service.sms_config is not None
         assert isinstance(service.sms_client, AliyunSMSClient)
+
+    @patch.dict(os.environ, {
+        'SMS_PROVIDER': 'aliyun',
+        'ALIBABA_CLOUD_ACCESS_KEY_ID': 'env_key_id',
+        'ALIBABA_CLOUD_ACCESS_KEY_SECRET': 'env_key_secret',
+        'ALIYUN_SMS_SIGN_NAME': '深圳市时空感应网络科技',
+        'ALIYUN_SMS_TEMPLATE_CODE': 'SMS_511560412',
+        'ALIYUN_SMS_REGION_ID': 'cn-qingdao',
+    }, clear=True)
+    @patch('services.notification.sms_service.get_db')
+    def test_load_aliyun_config_from_environment(self, mock_get_db):
+        mock_db = Mock()
+        mock_get_db.return_value = iter([mock_db])
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+
+        with patch.object(AliyunSMSClient, '_create_sdk_client', return_value=Mock()), \
+             patch.object(AliyunSMSClient, '_load_request_factory', return_value=Mock()):
+            service = SMSService()
+
+        assert isinstance(service.sms_client, AliyunSMSClient)
+        assert service.sms_config['template_code'] == 'SMS_511560412'
+        assert service.sms_client.region_id == 'cn-qingdao'
     
     @patch('services.notification.sms_service.get_db')
     def test_load_tencent_config(self, mock_get_db):
@@ -357,7 +389,9 @@ class TestSMSService:
             mock_template
         ]
         
-        with patch.object(AliyunSMSClient, 'send_sms', return_value=True) as mock_send:
+        with patch.object(AliyunSMSClient, '_create_sdk_client', return_value=Mock()), \
+             patch.object(AliyunSMSClient, '_load_request_factory', return_value=Mock()), \
+             patch.object(AliyunSMSClient, 'send_sms', return_value=True) as mock_send:
             service = SMSService()
             result = service.send_sms(
                 to_phone='+8613800138000',
@@ -457,7 +491,9 @@ class TestSMSService:
             mock_template
         ]
         
-        with patch.object(AliyunSMSClient, 'send_sms', return_value=True) as mock_send:
+        with patch.object(AliyunSMSClient, '_create_sdk_client', return_value=Mock()), \
+             patch.object(AliyunSMSClient, '_load_request_factory', return_value=Mock()), \
+             patch.object(AliyunSMSClient, 'send_sms', return_value=True) as mock_send:
             service = SMSService()
             result = service.send_verification_sms(
                 to_phone='+8613800138000',

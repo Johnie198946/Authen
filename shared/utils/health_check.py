@@ -123,7 +123,19 @@ def check_rabbitmq_health() -> Dict[str, Any]:
         - response_time: 响应时间（毫秒）
         - details: 详细信息
     """
+    from shared.config import settings
+
     start_time = time.time()
+    if not settings.RABBITMQ_ENABLED:
+        return {
+            "status": "disabled",
+            "message": "RabbitMQ未启用",
+            "response_time": 0.0,
+            "details": {
+                "required": False,
+                "checked_at": datetime.utcnow().isoformat(),
+            },
+        }
     
     try:
         from shared.rabbitmq_client import get_rabbitmq_connection
@@ -190,13 +202,20 @@ def check_overall_health() -> Dict[str, Any]:
         "rabbitmq": rabbitmq_health
     }
     
-    healthy_count = sum(1 for comp in components.values() if comp["status"] == "healthy")
-    total_count = len(components)
+    required_components = {
+        name: component
+        for name, component in components.items()
+        if component["status"] != "disabled"
+    }
+    healthy_count = sum(
+        1 for comp in required_components.values() if comp["status"] == "healthy"
+    )
+    total_count = len(required_components)
     
     # 确定整体状态
     if healthy_count == total_count:
         overall_status = "healthy"
-        overall_message = "所有组件运行正常"
+        overall_message = "所有必需组件运行正常"
     elif healthy_count > 0:
         overall_status = "degraded"
         overall_message = f"{healthy_count}/{total_count} 组件运行正常"

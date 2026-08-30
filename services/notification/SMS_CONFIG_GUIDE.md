@@ -4,6 +4,28 @@
 
 ## 阿里云短信服务配置
 
+### 推荐：使用部署环境变量
+
+生产环境优先使用环境变量，不要把 AccessKey Secret 写入代码、Git 或数据库：
+
+```bash
+SMS_PROVIDER=aliyun
+ALIBABA_CLOUD_ACCESS_KEY_ID=<RAM用户AccessKey ID>
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=<RAM用户AccessKey Secret>
+ALIYUN_SMS_SIGN_NAME=深圳市时空感应网络科技
+ALIYUN_SMS_TEMPLATE_CODE=SMS_511560412
+ALIYUN_SMS_REGION_ID=cn-qingdao
+ALIYUN_SMS_ENDPOINT=dysmsapi.aliyuncs.com
+```
+
+代码使用阿里云官方 `alibabacloud-dysmsapi20170525` V2 SDK 调用
+`SendSms`。`RegionId` 采用 OpenAPI Explorer 链接中的 `cn-qingdao`，中国站
+Endpoint 仍为 `dysmsapi.aliyuncs.com`。
+
+数据库配置仍作为兼容路径保留；如果数据库中没有启用的短信配置，服务会自动
+尝试上述环境变量。环境变量模式下，验证码模板 Code 直接读取
+`ALIYUN_SMS_TEMPLATE_CODE`，无需额外更新 `message_templates` 表。
+
 ### 1. 获取AccessKey
 
 1. 登录[阿里云控制台](https://ram.console.aliyun.com/manage/ak)

@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6380/0"
     
     # RabbitMQ配置
-    RABBITMQ_URL: str = "amqp://authuser:authpass123@localhost:5672"
+    RABBITMQ_URL: str = "amqp://authuser:***@localhost:5672"
+    # 当前生产通知走同步短信/OAuth路径；只有显式启用消息队列时，
+    # RabbitMQ 才属于健康门禁的必需组件。
+    RABBITMQ_ENABLED: bool = False
     
     # JWT配置
     JWT_SECRET_KEY: str = "your-secret-key-change-in-production"
@@ -30,6 +33,13 @@ class Settings(BaseSettings):
     APP_NAME: str = "Unified Auth Platform"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
+
+    # 服务间与订阅管理鉴权。生产环境必须通过环境变量覆盖。
+    AI_PLATFORM_SERVICE_TOKEN: str = ""
+    SUBSCRIPTION_ADMIN_TOKEN: str = ""
+    AI_PLATFORM_ENTITLEMENT_WEBHOOK_URL: str = ""
+    AI_PLATFORM_ENTITLEMENT_WEBHOOK_SECRET: str = ""
+    KNOWLEDGE_APPROVAL_SECRET: str = ""
     
     # CORS配置
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"]

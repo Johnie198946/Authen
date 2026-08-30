@@ -143,7 +143,8 @@ def test_check_rabbitmq_health_success():
     - 包含响应时间
     - 包含RabbitMQ详情
     """
-    with patch('shared.rabbitmq_client.get_rabbitmq_connection') as mock_get_connection:
+    with patch('shared.config.settings.RABBITMQ_ENABLED', True), \
+         patch('shared.rabbitmq_client.get_rabbitmq_connection') as mock_get_connection:
         # 模拟RabbitMQ连接
         mock_connection = MagicMock()
         mock_connection.is_open = True
@@ -172,7 +173,8 @@ def test_check_rabbitmq_health_failure():
     - 返回unhealthy状态
     - 包含错误信息
     """
-    with patch('shared.rabbitmq_client.get_rabbitmq_connection') as mock_get_connection:
+    with patch('shared.config.settings.RABBITMQ_ENABLED', True), \
+         patch('shared.rabbitmq_client.get_rabbitmq_connection') as mock_get_connection:
         # 模拟RabbitMQ连接失败
         mock_get_connection.side_effect = Exception("Connection refused")
         
@@ -182,6 +184,27 @@ def test_check_rabbitmq_health_failure():
         assert "RabbitMQ连接失败" in result["message"]
         assert "response_time" in result
         assert "error" in result["details"]
+
+
+def test_check_rabbitmq_health_disabled_is_explicit_and_non_degrading():
+    with patch('shared.config.settings.RABBITMQ_ENABLED', False):
+        rabbitmq = check_rabbitmq_health()
+
+    assert rabbitmq["status"] == "disabled"
+    assert rabbitmq["details"]["required"] is False
+
+    with patch('shared.utils.health_check.check_database_health') as mock_db, \
+         patch('shared.utils.health_check.check_redis_health') as mock_redis, \
+         patch('shared.utils.health_check.check_rabbitmq_health') as mock_rabbitmq:
+        mock_db.return_value = {"status": "healthy", "message": "OK"}
+        mock_redis.return_value = {"status": "healthy", "message": "OK"}
+        mock_rabbitmq.return_value = rabbitmq
+
+        result = check_overall_health()
+
+    assert result["status"] == "healthy"
+    assert result["message"] == "所有必需组件运行正常"
+    assert result["components"]["rabbitmq"]["status"] == "disabled"
 
 
 def test_check_overall_health_all_healthy():
@@ -205,7 +228,7 @@ def test_check_overall_health_all_healthy():
         result = check_overall_health()
         
         assert result["status"] == "healthy"
-        assert result["message"] == "所有组件运行正常"
+        assert result["message"] == "所有必需组件运行正常"
         assert "timestamp" in result
         assert "components" in result
         assert len(result["components"]) == 3
