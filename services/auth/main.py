@@ -82,6 +82,7 @@ class LoginResponse(BaseModel):
     token_type: str = "Bearer"
     expires_in: int
     user: dict
+    is_new_user: bool = False
 
 
 class RefreshTokenRequest(BaseModel):
@@ -781,13 +782,21 @@ async def login_with_phone_code(
             detail="验证码无效或已过期"
         )
 
-    # 查找用户
+    # 查找用户；短信验证码已经证明手机号所有权，因此首次验证码登录可直接
+    # 建立一个无密码账号。后续仍只允许验证码/OAuth 等已验证方式登录。
     user = db.query(User).filter(User.phone == request.phone).first()
+    is_new_user = user is None
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户不存在"
+        user = User(
+            username=f"phone_{uuid.uuid4().hex[:12]}",
+            phone=request.phone,
+            password_hash=None,
+            password_changed=True,
+            status="active",
         )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     # 检查账号锁定
     if user.status == 'locked' or (user.locked_until and user.locked_until > datetime.utcnow()):
@@ -842,7 +851,8 @@ async def login_with_phone_code(
             "username": user.username,
             "email": user.email,
             "requires_password_change": not user.password_changed
-        }
+        },
+        is_new_user=is_new_user,
     )
 
 @app.post("/api/v1/auth/login/email-code", response_model=LoginResponse)
