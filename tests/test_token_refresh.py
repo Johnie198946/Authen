@@ -10,7 +10,7 @@ Feature: unified-auth-platform, Property 5: Token刷新往返
 """
 import pytest
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hypothesis import given, strategies as st, assume
 from shared.utils.jwt import create_access_token, create_refresh_token, decode_token
 from shared.config import settings
@@ -116,8 +116,8 @@ def test_refresh_token_validity_period(user_id):
     assert decoded["sub"] == user_id, "应该包含正确的用户ID"
     
     # 验证过期时间设置正确（14天）
-    exp_time = datetime.fromtimestamp(decoded["exp"])
-    now = datetime.utcnow()
+    exp_time = datetime.fromtimestamp(decoded["exp"], timezone.utc)
+    now = datetime.now(timezone.utc)
     expected_exp = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     
     # 允许1小时的误差

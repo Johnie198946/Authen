@@ -180,7 +180,7 @@ def filter_sensitive_data(data: dict) -> dict:
         "password", "old_password", "new_password",
         "token", "access_token", "refresh_token",
         "secret", "api_key", "private_key",
-        "credit_card", "ssn"
+        "credit_card", "ssn", "state", "ticket", "code", "verification_code"
     ]
     
     filtered_data = {}

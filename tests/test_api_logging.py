@@ -44,8 +44,10 @@ def db():
 
 
 @pytest.fixture
-def test_app(db):
+def test_app(db, monkeypatch):
     """创建测试应用"""
+    import shared.database as database
+    monkeypatch.setattr(database, "SessionLocal", TestingSessionLocal)
     app = FastAPI()
     
     # 添加API日志中间件

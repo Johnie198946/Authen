@@ -1,0 +1,7 @@
+{
+  "git status --short --branch": "## codex/ios-web-login-modal-20261010...origin/main\n",
+  "git branch --show-current": "codex/ios-web-login-modal-20261010\n",
+  "git rev-parse HEAD": "132ea99883b8560f0890dd7267a13833e6bedf62\n",
+  "git remote -v": "origin\thttps://github.com/Johnie198946/Authen.git (fetch)\norigin\thttps://github.com/Johnie198946/Authen.git (push)\n",
+  "git worktree list --porcelain": "worktree /Users/dengzhaoyu/Desktop/TepVis/AI产品/KnowlegeGragh/Authen\nHEAD 89efbe96d717334e4bf504276b2f267825839891\nbranch refs/heads/main\n\nworktree /private/tmp/authen-reconcile\nHEAD b4b66c5b83133f16695a18d11c0117bff1c98b71\nbranch refs/heads/reconcile/production-20260830\nprunable gitdir file points to non-existent location\n\nworktree /Users/dengzhaoyu/Desktop/TepVis/.worktrees/authen-app-login-20261010\nHEAD 132ea99883b8560f0890dd7267a13833e6bedf62\nbranch refs/heads/codex/ios-web-login-modal-20261010\n\n"
+}

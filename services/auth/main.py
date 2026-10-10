@@ -4,14 +4,17 @@
 import sys
 import os
 import asyncio
+import hashlib
+import re
+import time
 
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import secrets
@@ -19,7 +22,7 @@ import uuid
 from shared.database import get_db
 from shared.models.user import User
 from shared.utils.crypto import hash_password, verify_password
-from shared.utils.jwt import create_access_token, create_refresh_token, human_principal_claims
+from shared.utils.jwt import create_access_token, create_refresh_token, human_principal_claims, decode_token
 from shared.utils.validators import validate_password, validate_username
 from shared.utils.sso_session import create_sso_session
 from shared.redis_client import get_redis
@@ -1254,6 +1257,179 @@ async def oauth_authorize(provider: str, redirect_uri: str, state: str = None):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取授权URL失败: {str(e)}"
         )
+
+
+
+# App approval is owned by Authen; six digits alone never authorize a browser.
+class AppLoginStart(BaseModel):
+    phone: str
+
+
+class AppLoginState(BaseModel):
+    state: str = Field(min_length=32, max_length=100)
+
+
+class AppLoginCode(BaseModel):
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class AppLoginTicket(BaseModel):
+    ticket: str = Field(min_length=32, max_length=100)
+
+
+def app_login_hash(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def app_login_key(flow_id):
+    if not re.fullmatch(r"[a-f0-9]{64}", flow_id):
+        raise HTTPException(404, "登录请求不存在")
+    return "app_login:" + flow_id
+
+
+async def app_login_user(authorization: str = Header(None), db: Session = Depends(get_db)):
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    payload = decode_token(token, audience=settings.JWT_ACCESS_AUDIENCE, token_use="access")
+    if not payload:
+        raise HTTPException(401, "请先登录 Quantum")
+    if payload.get("principal_type") != "human" or not payload.get("amr") or not payload.get("auth_time"):
+        raise HTTPException(403, "请使用本人登录的 Quantum 账号确认")
+    try:
+        user_id = uuid.UUID(str(payload.get("sub")))
+    except ValueError:
+        raise HTTPException(401, "登录身份无效")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.status != "active" or (user.locked_until and user.locked_until > datetime.utcnow()):
+        raise HTTPException(403, "账号不可用于网页登录")
+    return user
+
+
+@app.post("/api/v1/auth/app-login/start")
+async def app_login_start(request: AppLoginStart, db: Session = Depends(get_db)):
+    phone = re.sub(r"[\s-]", "", request.phone.strip())
+    if phone.startswith("0086"):
+        phone = "+86" + phone[4:]
+    elif len(phone) == 13 and phone.startswith("86"):
+        phone = "+" + phone
+    elif len(phone) == 11:
+        phone = "+86" + phone
+    if not re.fullmatch(r"\+861[3-9][0-9]{9}", phone):
+        raise HTTPException(422, "请输入有效的中国大陆手机号")
+    redis = get_redis()
+    # Rate-limit both known and unknown accounts identically.
+    if not redis.set("app_login_rate:" + app_login_hash(phone), "1", nx=True, ex=30):
+        raise HTTPException(429, "请稍后重新发起登录")
+    user = db.query(User).filter(User.phone == phone, User.status == "active").first()
+    state = secrets.token_urlsafe(32)
+    flow_id = app_login_hash(state)
+    expires = int(time.time()) + 300
+    owner = str(user.id) if user else ""
+    with redis.pipeline() as pipe:
+        pipe.hset(app_login_key(flow_id), mapping={"user_id": owner, "code": f"{secrets.randbelow(1000000):06d}",
+                  "status": "pending", "expires_at": str(expires)})
+        pipe.expire(app_login_key(flow_id), 300)
+        if owner:
+            pipe.zadd("app_login_user:" + owner, {flow_id: expires})
+            pipe.expire("app_login_user:" + owner, 600)
+        pipe.execute()
+    return {"state": state, "expires_at": expires}
+
+
+@app.get("/api/v1/auth/app-login/pending")
+async def app_login_pending(user=Depends(app_login_user)):
+    redis = get_redis()
+    index = "app_login_user:" + str(user.id)
+    redis.zremrangebyscore(index, "-inf", int(time.time()))
+    items = []
+    for flow_id in redis.zrevrange(index, 0, 2):
+        row = redis.hgetall(app_login_key(flow_id))
+        if row.get("user_id") == str(user.id) and row.get("status") == "pending":
+            items.append({"id": flow_id, "code": row["code"], "destination": "www.t-react.com / QuanSyn",
+                          "expires_at": int(row["expires_at"])})
+    return {"items": items}
+
+
+@app.post("/api/v1/auth/app-login/{flow_id}/confirm")
+async def app_login_confirm(flow_id: str, request: AppLoginCode, user=Depends(app_login_user)):
+    ticket = secrets.token_urlsafe(32)
+    redis = get_redis()
+    result = redis.eval("""
+        if redis.call('HGET', KEYS[1], 'user_id') ~= ARGV[1] then return 0 end
+        if redis.call('HGET', KEYS[1], 'code') ~= ARGV[2] then return -1 end
+        local status = redis.call('HGET', KEYS[1], 'status')
+        if status == 'approved' then return 1 end
+        if status ~= 'pending' then return 0 end
+        local ttl = redis.call('TTL', KEYS[1])
+        if ttl <= 0 then return 0 end
+        redis.call('HSET', KEYS[1], 'status', 'approved', 'ticket', ARGV[3])
+        redis.call('SET', KEYS[2], ARGV[4], 'EX', ttl)
+        redis.call('ZREM', KEYS[3], ARGV[4])
+        return 1
+        """, 3, app_login_key(flow_id), "app_login_ticket:" + app_login_hash(ticket),
+        "app_login_user:" + str(user.id),
+        str(user.id), request.code, ticket, flow_id)
+    if result != 1:
+        raise HTTPException(403 if result == -1 else 409, "验证码不符或登录请求已失效")
+    return {"success": True}
+
+
+@app.post("/api/v1/auth/app-login/{flow_id}/cancel")
+async def app_login_cancel(flow_id: str, user=Depends(app_login_user)):
+    get_redis().eval("""
+        if redis.call('HGET', KEYS[1], 'user_id') == ARGV[1]
+          and redis.call('HGET', KEYS[1], 'status') == 'pending' then
+          redis.call('HSET', KEYS[1], 'status', 'cancelled')
+          redis.call('ZREM', KEYS[2], ARGV[2])
+        end
+        return 1
+        """, 2, app_login_key(flow_id), "app_login_user:" + str(user.id), str(user.id), flow_id)
+    return {"success": True}
+
+
+@app.post("/api/v1/auth/app-login/status")
+async def app_login_status(request: AppLoginState):
+    row = get_redis().hgetall(app_login_key(app_login_hash(request.state)))
+    if not row or row.get("status") == "consumed":
+        raise HTTPException(410, "登录请求已过期或完成，请重新发起")
+    result = {"status": row["status"]}
+    if row["status"] == "approved":
+        result["ticket"] = row["ticket"]
+    return result
+
+
+@app.post("/api/v1/auth/app-login/complete", response_model=LoginResponse)
+async def app_login_complete(request: AppLoginTicket, db: Session = Depends(get_db)):
+    redis = get_redis()
+    ticket_key = "app_login_ticket:" + app_login_hash(request.ticket)
+    flow_id = redis.get(ticket_key)
+    if not flow_id:
+        raise HTTPException(401, "登录票据无效或已使用")
+    key = app_login_key(flow_id)
+    owner = redis.hget(key, "user_id")
+    user = db.query(User).filter(User.id == uuid.UUID(owner)).first() if owner else None
+    if not user or user.status != "active" or (user.locked_until and user.locked_until > datetime.utcnow()):
+        raise HTTPException(403, "账号不可用于网页登录")
+    consumed = redis.eval("""
+        if redis.call('GET', KEYS[1]) ~= ARGV[1]
+          or redis.call('HGET', KEYS[2], 'status') ~= 'approved'
+          or redis.call('HGET', KEYS[2], 'user_id') ~= ARGV[2] then return 0 end
+        redis.call('DEL', KEYS[1])
+        redis.call('HSET', KEYS[2], 'status', 'consumed')
+        redis.call('HDEL', KEYS[2], 'ticket', 'code')
+        return 1
+        """, 2, ticket_key, key, flow_id, str(user.id))
+    if consumed != 1:
+        raise HTTPException(401, "登录票据已使用或过期")
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+    sso = create_sso_session(str(user.id), db)
+    claims = {"sub": str(user.id), "username": user.username, "email": user.email,
+              **human_principal_claims("otp")}
+    return LoginResponse(access_token=create_access_token(claims),
+        refresh_token=create_refresh_token({"sub": str(user.id), **human_principal_claims("otp")}),
+        sso_session_token=sso.session_token, expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user={"id": str(user.id), "username": user.username, "email": user.email,
+              "requires_password_change": not user.password_changed})
 
 
 if __name__ == "__main__":
