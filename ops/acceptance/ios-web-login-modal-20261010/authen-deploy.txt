@@ -1,0 +1,10 @@
+curl: (7) Failed to connect to 127.0.0.1 port 8001 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8001 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8001 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 8001 after 0 ms: Couldn't connect to server
+active
+app_login_routes_present=true
+server_after=dd981f8ab5efab53b182f4a1c7858cab6eb2d4f8
+rollback_point=/opt/ai-lab-shared/rollbacks/authen-app-login-20261010.n0uOAS
+health_check=200
+functional_check=routes_present_and_absent_state_410
